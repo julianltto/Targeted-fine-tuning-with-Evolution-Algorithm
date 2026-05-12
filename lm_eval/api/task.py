@@ -1,6 +1,7 @@
 import abc
 import ast
 import logging
+import os
 import random
 import re
 from collections.abc import Callable
@@ -926,10 +927,15 @@ class ConfigurableTask(Task):
                     )
 
     def download(self, dataset_kwargs: Optional[Dict[str, Any]] = None) -> None:
+        kwargs = dict(dataset_kwargs) if dataset_kwargs else {}
+        # `datasets>=4.0` removed the `trust_remote_code` kwarg. Drop it
+        # silently — the env var below covers the legitimate use case.
+        kwargs.pop("trust_remote_code", None)
+        os.environ.setdefault("HF_DATASETS_TRUST_REMOTE_CODE", "1")
         self.dataset = datasets.load_dataset(
             path=self.DATASET_PATH,
             name=self.DATASET_NAME,
-            **dataset_kwargs if dataset_kwargs is not None else {},
+            **kwargs,
         )
 
     def has_training_docs(self) -> bool:

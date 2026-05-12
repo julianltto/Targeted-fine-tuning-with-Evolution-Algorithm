@@ -29,6 +29,7 @@ import pandas as pd
 import numpy as np
 import re
 import lm_eval
+from lm_eval.tasks import TaskManager
 import json 
 from types import MethodType
 
@@ -74,7 +75,7 @@ dataset_list.append(train)
 
 if args.pre_train_eval:
     if args.train_lm_eval_task is not None:
-        task_manager = lm_eval.tasks.TaskManager()
+        task_manager = TaskManager()
         #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
         # Setting `task_manager` to the one above is optional and should generally be done
         # if you want to include tasks from paths other than ones in `lm_eval/tasks`.
@@ -386,7 +387,7 @@ for repeat in range(0, num_repeats):
             obj.forward = MethodType(factory(layer_mask.to('cuda')), obj)
                 
         if args.train_lm_eval_task is not None:
-            task_manager = lm_eval.tasks.TaskManager()
+            task_manager = TaskManager()
             #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
             # Setting `task_manager` to the one above is optional and should generally be done
             # if you want to include tasks from paths other than ones in `lm_eval/tasks`.

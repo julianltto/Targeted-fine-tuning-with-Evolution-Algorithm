@@ -1,536 +1,467 @@
+"""
+Refactored MathNeuro pruning pipeline.
+
+Stages:
+    1) Load the YAML config, training data, calibration datasets, model, and tokenizer.
+    2) Optional pre-pruning evaluation (SGSM few-shot accuracy + lm_eval baselines).
+    3) For each (calibration dataset, repeat, keep_ratio):
+       - Reload a fresh copy of the model.
+       - Compute math vs. calibration importance using mathneuro.core.
+       - Build the math-specific multiplicative mask and apply it in place.
+       - Run post-pruning evaluation and save results.
+"""
+from __future__ import annotations
+
+import json
 import os
-import argparse
-parser = argparse.ArgumentParser()
-parser.add_argument('--model', help="Huggingface model to train, entered as string", type = str)
-parser.add_argument('--eval_datasets', nargs='+', help="dataset(s) to evaluate models on post pruning to evalaute catastrophic forgetting, entered as strings; should be task names from Eleuther AI LM Evaluation Harness", type = str)
-parser.add_argument('--train_dataset', help="path to math train dataset; should be a path to a CSV file with question/solution pairs in a columns titled 'question' and 'solution' along with ground-truth answers in a column called 'answer'", type = str)
-parser.add_argument('--calibration_datasets', nargs='+', help="path to calibration datasets; should be paths to CSV files with instruction/response pairs in a column titled 'qa'", type = str)
-parser.add_argument('--save_path', help="save path for eval results after running Eleuther AI LM Evaluation Harness post pruning", type = str)
-parser.add_argument('--text_file', help="name of text file for saving pruning results during training if evaluating math reasoning using a non-Eleuther AI LM Evaluation Harness task in a PoT format", type = str)
-parser.add_argument('--num_repeats', help="number of repeats for pruning or scaling experiment", type = int, default = 5)
-parser.add_argument('--pre_train_eval', help="bool to indicate if full evaluation on eval and train datasets should be conducted before training", action="store_true")
-parser.add_argument('--random_state', help="random state for initial dataset shuffling and creating train/eval split for train dataset", type = int, default = 42)
-parser.add_argument('--scalar', help="scale factor for top parameters; default is 0 to run pruning experiments", type = float, default = 0)
-parser.add_argument('--eval_dataset_size', help="desired number of samples for task specific eval dataset", type = int, default = None)
-parser.add_argument('--eval_dataset_subset', help="desired number of samples for task specific eval dataset if subsetting to reduce run time", type = int, default = 100)
-parser.add_argument('--calibration_dataset_names', nargs='+', help="desired name of calibration datasets; should be strings entered in same order as calibration_datasets", type = str)
-parser.add_argument('--num_samples', help="desired number of samples for calculating task specific parameters", type = int, default = 500)
-parser.add_argument('--train_lm_eval_task', help="if your training dataset is an Eleuther AI LM Evaluation Harness task, specify the associated task for the test set.", type = str, default = None)
-parser.add_argument('--proportion', help="desired proportion of top parameters to calculate", type = float, default = None)
-args = parser.parse_args()
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import re
+from dataclasses import dataclass
+from typing import Any, Callable, cast
+
+import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import pandas as pd
-import numpy as np
-import re
-import lm_eval
-import json 
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-if 'sgsm' in args.train_dataset:
-    df = pd.read_csv(args.train_dataset) # Load SGSM dataset for few-shot prompting
-    df = df[df['subset']=="sgsm_train"] # Subset SGSM to verified training subset
-    df = df.sample(frac = 1, random_state = args.random_state)
-    for i in range(0, len(df)):
-        try:
-            answer = df.iloc[i]['answer']
-            answer = float(answer)
-            df.iloc[i]['answer'] = answer
-        except:
-            df = df.drop([i])
-    
-    train = df.iloc[0:1500]
-    
-    val = df.iloc[1500:]
-    val = val.sample(frac = 1, random_state = args.random_state)
+from lm_eval import simple_evaluate
+from lm_eval.tasks import TaskManager
 
-if 'sgsm' not in args.train_dataset:
-    train = pd.read_csv(args.train_dataset) # Load SGSM dataset for few-shot prompting
-    train = train.sample(frac = 1, random_state = args.random_state)
-    
+from mathneuro_config import load_config
+from mathneuro.core import (
+    apply_mask_to_model,
+    build_prune_mask,
+    compute_importance,
+    make_calibration_prompt_fn,
+    make_math_prompt_fn,
+    register_activation_hooks,
+    remove_hooks,
+    top_k_mask,
+)
 
-calibration_datasets = []
-for dataset in args.calibration_datasets:
-    if '/' in dataset:
-        dataset_name = dataset.split('/')[-1]
-        dataset_name = dataset_name.split('.csv')[0]
-        calibration_datasets.append(dataset_name)
-    else:
-        dataset_name = dataset.split('.csv')[0]
-        calibration_datasets.append(dataset_name)
 
-dataset_list = []
-for dataset, dataset_name, name in zip(args.calibration_datasets, calibration_datasets, args.calibration_dataset_names):
-    # Load the dataset into a DataFrame
-    globals()[dataset_name] = pd.read_csv(dataset).sample(frac=1, random_state=args.random_state)  # Shuffle the DataFrame
-    
-    # Assign a name attribute to the DataFrame
-    globals()[dataset_name].name = name
-    
-    # Append the actual DataFrame object to the list
-    dataset_list.append(globals()[dataset_name])
-    
-output_file = f"{args.save_path}/eval_results/{args.model}/{args.text_file}"
-results_path =  f"{args.save_path}/eval_results/{args.model}/"
-os.makedirs(os.path.dirname(results_path), exist_ok=True)
+@dataclass(frozen=True)
+class CalibrationDataset:
+    name: str
+    data: pd.DataFrame
 
-tokenizer = AutoTokenizer.from_pretrained(args.model)
-model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto", torch_dtype=torch.bfloat16)
-if args.pre_train_eval:
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+def load_train_dataset(args) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """
+    Load and shuffle the training dataset. For SGSM we also split off a validation set used by
+    the SGSM-specific few-shot Python-program evaluation.
+
+    Returns:
+        (train_df, val_df) — val_df is None when the dataset is not SGSM.
+    """
     if 'sgsm' in args.train_dataset:
-        prune_solve = []
-        prune_code = []
-        prune_solutions = []
-        for i in range(0, min(args.eval_dataset_subset, len(val))):
-            # Format the prompt
-            prompts = []
-            questions = []
-            final_question = val.iloc[i]['question']
-            final_answer = val.iloc[i]['answer']
-            final_prompt = f"""Instruct: {final_question} Let's write a Python program.\nOutput:"""
-    
-            for j in range(0, 8):
-                question = train['question'].iloc[j]
-                questions.append(question)
-                answer = train['solution'].iloc[j]
-                prompt = f"""Instruct: {question} Let's write a Python program.\nOutput:\n{answer}"""
-                if prompt not in prompts:
-                    prompts.append(prompt)
-    
-            prompts.append(final_prompt)
-            formatted_prompt = "\n\n".join(prompts)
-            #Query the model 
-            inputs = tokenizer.encode(formatted_prompt, return_tensors="pt").to(model.device)
-            model_answer = None
-            output = model.generate(inputs, max_new_tokens = 150)
-            generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-            # Split the generated text by the prompt to extract the newly generated part
-            generated_text_parts = generated_text.split(final_prompt)
-            solution_text = generated_text_parts[-1].strip()
-            prune_solutions.append(solution_text)
-            if "Instruct:" in solution_text:
-                solution_text = solution_text.split("Instruct:")[0] # Split up a generation that contains more than one question
-            if "print" in solution_text:
-                solution_text = solution_text.split("print")[0] # Split up a generation that contains a print statement
-            if "Student:" in solution_text:
-                solution_text = solution_text.split("Student:")[0] # Split up a generation that contains more than one question
-            if "Output:" in solution_text:
-                solution_text = solution_text.split("Output:")[0] # Split up a generation that contains more than one question
-            if "#TODO" in solution_text:
-                solution_text = solution_text.split("#TODO")[0] # Split up a generation that contains more than one question
-            #solutions.append(solution_text)
-            if 'return result' in solution_text:
-                # Split the string on 'return result' but keep 'return result' in the result
-                parts = re.split(r'(return result)', solution_text)
-    
-                # Rejoin the parts correctly
-                solution_text = parts[0] + parts[1]
-            try:
-                exec(solution_text)
-                model_answer = solution()
-                prune_code.append(1)
-                model_answer = float(model_answer)
-                if model_answer != final_answer:
-                    prune_solve.append(0)
-    
-                if model_answer == final_answer:
-                    prune_solve.append(1)
-    
-            except:
-                prune_code.append(0)
-                prune_solve.append(0)
-    
-        with open(output_file, "a") as f:  # Open the file in append mode ("a")
-                f.write(f"Average eval accuracy on {min(args.eval_dataset_subset, len(val))} questions before training with greedy decoding (few-shot): {np.mean(prune_solve)}\n") 
-        task_manager = lm_eval.tasks.TaskManager()
-        #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
-        # Setting `task_manager` to the one above is optional and should generally be done
-        # if you want to include tasks from paths other than ones in `lm_eval/tasks`.
-        # `simple_evaluate` will instantiate its own task_manager if it is set to None here.
-        results = lm_eval.simple_evaluate( # call simple_evaluate
-            model = 'hf',
-            model_args = {'pretrained':model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
-            tasks=args.eval_datasets,
-            task_manager=task_manager,
-            log_samples = False, 
-            batch_size = 'auto:4'
+        df = pd.read_csv(args.train_dataset)
+        df = df[df['subset'] == 'sgsm_train']
+        df = df.sample(frac=1, random_state=args.random_state)
+
+        # Drop rows whose answer cannot be parsed as a float (SGSM cleanup).
+        numeric = pd.to_numeric(df['answer'], errors='coerce')
+        df = df[numeric.notna()].copy()
+        df['answer'] = numeric[numeric.notna()].astype(float)
+
+        train = df.iloc[0:1500]
+        val = df.iloc[1500:].sample(frac=1, random_state=args.random_state)
+        return train, val
+
+    train = pd.read_csv(args.train_dataset).sample(frac=1, random_state=args.random_state)
+    return train, None
+
+
+def load_calibration_datasets(args) -> list[CalibrationDataset]:
+    """
+    Load every calibration dataset listed in the config and keep its display name for file naming
+    and prompt-fn selection.
+    """
+    datasets: list[CalibrationDataset] = []
+    for path, display_name in zip(args.calibration_datasets, args.calibration_dataset_names):
+        df = pd.read_csv(path).sample(frac=1, random_state=args.random_state)
+        datasets.append(CalibrationDataset(name=str(display_name), data=df))
+    return datasets
+
+
+# ---------------------------------------------------------------------------
+# Model / tokenizer
+# ---------------------------------------------------------------------------
+
+def load_model(model_name: str) -> nn.Module:
+    """
+    Load the model in bf16 with HF auto device map and disable sampling so generation is greedy
+    and deterministic.
+    """
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, device_map='auto', torch_dtype=torch.bfloat16,
+    )
+    model.generation_config.do_sample = False
+    model.generation_config.temperature = None
+    model.generation_config.top_p = None
+    model.generation_config.top_k = None
+    return model
+
+
+# ---------------------------------------------------------------------------
+# SGSM few-shot Python-program evaluation
+# ---------------------------------------------------------------------------
+
+# Markers that delimit a stray second turn / extra output inside a generated solution.
+_SOLUTION_TRUNCATE_MARKERS: tuple[str, ...] = (
+    'Instruct:', 'print', 'Student:', 'Output:', '#TODO',
+)
+
+
+def run_solution_code(solution_text: str) -> Any:
+    """
+    Execute a generated Python program that defines `solution()` and return its result.
+    The text is run in a fresh namespace so it cannot accidentally see our globals.
+    """
+    exec_namespace: dict[str, Any] = {}
+    exec(solution_text, exec_namespace)
+    solution_fn = exec_namespace.get('solution')
+    if not callable(solution_fn):
+        raise ValueError('Generated code did not define a callable solution().')
+    return cast(Callable[[], Any], solution_fn)()
+
+
+def clean_solution_text(solution_text: str) -> str:
+    """
+    Trim everything after the first occurrence of any truncation marker so we only execute the
+    first solution() body, then keep `return result` if present.
+    """
+    for marker in _SOLUTION_TRUNCATE_MARKERS:
+        if marker in solution_text:
+            solution_text = solution_text.split(marker)[0]
+    if 'return result' in solution_text:
+        parts = re.split(r'(return result)', solution_text)
+        solution_text = parts[0] + parts[1]
+    return solution_text
+
+
+def build_few_shot_prompt(train: pd.DataFrame, final_question: str, k: int = 8) -> str:
+    """Build a k-shot prompt: k (question, solution) demonstrations followed by the final question."""
+    demos: list[str] = []
+    for j in range(k):
+        question = train['question'].iloc[j]
+        answer = train['solution'].iloc[j]
+        demo = f"Instruct: {question} Let's write a Python program.\nOutput:\n{answer}"
+        if demo not in demos:
+            demos.append(demo)
+    demos.append(f"Instruct: {final_question} Let's write a Python program.\nOutput:")
+    return "\n\n".join(demos)
+
+
+def evaluate_sgsm_few_shot(
+    model: nn.Module,
+    tokenizer,
+    train: pd.DataFrame,
+    val: pd.DataFrame,
+    eval_subset: int,
+) -> float:
+    """
+    Run k-shot evaluation on a subset of the SGSM validation set: generate a Python program for
+    each question, execute it, and compare to the gold numeric answer.
+
+    Returns:
+        Mean accuracy in [0, 1] over the evaluated subset (0 if the subset is empty).
+    """
+    correct: list[int] = []
+    n = min(eval_subset, len(val))
+    for i in range(n):
+        final_question = str(val.iloc[i]['question'])
+        final_answer = float(val.iloc[i]['answer'])
+        formatted_prompt = build_few_shot_prompt(train, final_question)
+        final_prompt = f"Instruct: {final_question} Let's write a Python program.\nOutput:"
+
+        inputs = tokenizer.encode(formatted_prompt, return_tensors='pt').to(model.device)
+        output = cast(Any, model).generate(inputs, max_new_tokens=150)
+        generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+        solution_text = clean_solution_text(generated_text.split(final_prompt)[-1].strip())
+
+        try:
+            model_answer = float(run_solution_code(solution_text))
+            correct.append(1 if model_answer == final_answer else 0)
+        except Exception:
+            correct.append(0)
+
+    return sum(correct) / len(correct) if correct else 0.0
+
+
+# ---------------------------------------------------------------------------
+# lm_eval harness wrapper
+# ---------------------------------------------------------------------------
+
+def run_lm_eval(
+    model: nn.Module,
+    tokenizer,
+    tasks,
+    eval_subset: int,
+    random_state: int,
+    batch_size: int | str = 1,
+) -> dict:
+    """Run `lm_eval.simple_evaluate` on the given tasks and return its `results` dict."""
+    task_manager = TaskManager()
+    results = simple_evaluate(
+        model='hf',
+        model_args={'pretrained': model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
+        tasks=tasks,
+        task_manager=task_manager,
+        log_samples=False,
+        batch_size=batch_size,
+        limit=eval_subset,
+        random_seed=random_state,
+    )
+    if results is None:
+        raise RuntimeError('lm_eval.simple_evaluate returned None.')
+    return results['results']
+
+
+# ---------------------------------------------------------------------------
+# IO helpers
+# ---------------------------------------------------------------------------
+
+def append_text(output_file: str, line: str) -> None:
+    """Append a single line to the human-readable text results file (creates parent dirs)."""
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, 'a') as f:
+        f.write(line if line.endswith('\n') else line + '\n')
+
+
+def save_json(path: str, payload: Any) -> None:
+    """Write `payload` as JSON to `path`, creating parent directories if needed."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(payload, f)
+
+
+def make_results_root(args) -> str:
+    """Per-model results directory; everything else is named relative to this."""
+    root = f"{args.save_path}/eval_results/{args.model}/"
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+# ---------------------------------------------------------------------------
+# Pruning pipeline (uses mathneuro.core)
+# ---------------------------------------------------------------------------
+
+def _pick_calib_prompt_fn(df: pd.DataFrame, dataset_name: str) -> Callable[[pd.Series], str]:
+    """
+    Pick the prompt extractor for a calibration dataframe. Preserves the original convention:
+      - If `dataset_name` contains "Bad", treat the dataset as plain text (column '0').
+      - Otherwise treat it as math-like (use 'qa' if present, else 'question' + 'solution').
+    """
+    if 'Bad' in dataset_name:
+        return make_calibration_prompt_fn()
+    return make_math_prompt_fn(df)
+
+
+def prune_math_specific(
+    model: nn.Module,
+    tokenizer,
+    train_df: pd.DataFrame,
+    calib_df: pd.DataFrame,
+    calib_name: str,
+    keep_ratio: float,
+    num_samples: int,
+    factor: float,
+) -> None:
+    """
+    End-to-end pruning for one (train, calibration, keep_ratio) combination. Registers hooks,
+    runs forward passes on both datasets to score importance, builds the math-specific mask, and
+    multiplies it into the model parameters in place. Hooks are removed before returning.
+
+    Inputs:
+        train_df    : math training samples used to identify math-important weights.
+        calib_df    : calibration samples used to identify general-purpose important weights.
+        calib_name  : display name used to preserve the "Bad" calibration-dataset convention.
+        keep_ratio  : per-layer top-k ratio used by top_k_mask().
+        num_samples : number of forward passes per dataset.
+        factor      : multiplier applied to math-specific positions (0 = prune them out).
+    """
+    magnitude, handles = register_activation_hooks(model)
+    try:
+        math_scores = compute_importance(
+            model, tokenizer, train_df,
+            make_math_prompt_fn(train_df), magnitude, num_samples,
         )
-        results_path = f"{args.save_path}/eval_results/{args.model}/pre_results.json"
-        os.makedirs(os.path.dirname(results_path), exist_ok=True)
-        with open(results_path, "w") as outfile: 
-            json.dump(results['results'], outfile)
-    
+        calib_scores = compute_importance(
+            model, tokenizer, calib_df,
+            _pick_calib_prompt_fn(calib_df, calib_name), magnitude, num_samples,
+        )
+    finally:
+        remove_hooks(handles)
+
+    math_mask = top_k_mask(math_scores, keep_ratio)
+    calib_mask = top_k_mask(calib_scores, keep_ratio)
+    pruning_mask = build_prune_mask(math_mask, calib_mask, factor=factor)
+    apply_mask_to_model(model, pruning_mask)
+
+
+# ---------------------------------------------------------------------------
+# Evaluation orchestration
+# ---------------------------------------------------------------------------
+
+def run_pre_train_eval(
+    args,
+    model: nn.Module,
+    tokenizer,
+    train: pd.DataFrame,
+    val: pd.DataFrame | None,
+    results_root: str,
+    output_file: str,
+) -> None:
+    """Optional baseline evaluation before any pruning happens."""
+    if 'sgsm' in args.train_dataset:
+        assert val is not None, "SGSM training set must produce a validation split."
+        acc = evaluate_sgsm_few_shot(model, tokenizer, train, val, args.eval_dataset_subset)
+        n = min(args.eval_dataset_subset, len(val))
+        append_text(
+            output_file,
+            f"Average eval accuracy on {n} questions before training with greedy decoding "
+            f"(few-shot): {acc}",
+        )
+        results = run_lm_eval(
+            model, tokenizer, args.eval_datasets, args.eval_dataset_subset, args.random_state,
+        )
+        save_json(f"{results_root}pre_results.json", results)
+
     if args.train_lm_eval_task is not None:
-        task_manager = lm_eval.tasks.TaskManager()
-        #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
-        # Setting `task_manager` to the one above is optional and should generally be done
-        # if you want to include tasks from paths other than ones in `lm_eval/tasks`.
-        # `simple_evaluate` will instantiate its own task_manager if it is set to None here.
-        results = lm_eval.simple_evaluate( # call simple_evaluate
-            model = 'hf',
-            model_args = {'pretrained':model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
-            tasks=args.train_lm_eval_task,
-            task_manager=task_manager,
-            log_samples = False, 
-            batch_size = 'auto:4',
-            limit = args.eval_dataset_subset, 
-            random_seed = args.random_state
+        train_results = run_lm_eval(
+            model, tokenizer, args.train_lm_eval_task,
+            args.eval_dataset_subset, args.random_state,
         )
-        results_path = f"{args.save_path}/eval_results/{args.model}/pre_results_train_task.json"
-        os.makedirs(os.path.dirname(results_path), exist_ok=True)
-        with open(results_path, "w") as outfile: 
-            json.dump(results['results'], outfile)
-        
-        results = lm_eval.simple_evaluate( # call simple_evaluate
-            model = 'hf',
-            model_args = {'pretrained':model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
-            tasks=args.eval_datasets,
-            task_manager=task_manager,
-            log_samples = False, 
-            batch_size = 'auto:4'
+        save_json(f"{results_root}pre_results_train_task.json", train_results)
+
+        eval_results = run_lm_eval(
+            model, tokenizer, args.eval_datasets,
+            args.eval_dataset_subset, args.random_state,
         )
-        results_path = f"{args.save_path}/eval_results/{args.model}/pre_results.json"
-        os.makedirs(os.path.dirname(results_path), exist_ok=True)
-        with open(results_path, "w") as outfile: 
-            json.dump(results['results'], outfile)
-            
-magnitude = {}
-def getActivation(name):
-    # The hook function
-    def hook(module, input, output):
-        activations = input[0]  # Get the input activations
-        weights = module.weight.data  # Get the weights
-        # Compute the norm of activations along dim=1
-        activations_norm = activations.norm(p=2, dim=1).to(torch.bfloat16)
-        # Multiply activations by the absolute value of weights
-        modified_output = activations_norm * torch.abs(weights)
-        magnitude[name] = modified_output.detach()  # Store the modified output
-    # Return the hook function
-    return hook
-
-for name, module in model.named_modules():
-    if (isinstance(module, (nn.Linear))):
-        hook_fn = getActivation(name)  # Get the hook function
-        module.register_forward_hook(hook_fn)  # Register the hook function
-
-if 'bad_gens_full.csv' in args.calibration_datasets:
-    def find_params(model, gens, keep_ratio, prune = True, largest = True, num_samples = len(bad_gens_full)):
-        global chosen_params
-        cuda_device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        param_dict = {}
-        for name, param in model.named_parameters():
-            param_dict[name] = torch.zeros_like(param).to(param.device)
-        
-        for i in range(0, num_samples):
-            inputs = tokenizer.encode(gens.iloc[i]['0'], return_tensors="pt").to(model.device)
-            outputs = model(inputs)
-            for key, tensor in magnitude.items():
-                try:
-                    param_dict[f"{key}.weight"] += tensor
-                except:
-                    pass
-        keys_to_remove = [key for key in param_dict if key.split('.weight')[0] not in magnitude]
-    
-        for key in keys_to_remove:
-            del param_dict[key]
-        
-        mask_dict = {}
-    
-    
-        for k, v in param_dict.items():
-            if "embed" in k:
-                if prune == False:
-                    mask_dict[k] = torch.zeros_like(v).to(v.device)
-                else:
-                    mask_dict[k] = torch.ones_like(v).to(v.device)
-    
-            else:
-                if prune == False:
-                    sizes = v.shape
-                    num_params = v.numel()
-                    keep_num = int(num_params * keep_ratio)
-                    tensor = v.view(-1)
-                    top_pos = torch.topk(torch.abs(tensor), keep_num, largest = largest)[1]
-                    mask_dict[k] = torch.zeros_like(tensor, device=tensor.device)
-                    mask_dict[k][top_pos] = 1
-                    mask_dict[k] = mask_dict[k].reshape(v.shape).to(tensor.device)
-                else:
-                    sizes = v.shape
-                    num_params = v.numel()
-                    keep_num = int(num_params * keep_ratio)
-                    tensor = v.view(-1)
-                    top_pos = torch.topk(torch.abs(tensor), keep_num, largest = largest)[1]
-                    mask_dict[k] = torch.ones_like(tensor, device=tensor.device)
-                    mask_dict[k][top_pos] = 0
-                    mask_dict[k] = mask_dict[k].reshape(v.shape).to(tensor.device)
-    
-        return mask_dict
-        
-    
-def find_good_params(model, train, keep_ratio, prune = True, largest = True, num_samples = len(train)):
-    global chosen_params
-    import random
-
-    cuda_device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    param_dict = {}
-    for name, param in model.named_parameters():
-        param_dict[name] = torch.zeros_like(param).to(param.device)
-            
-    for i in range(0, num_samples):
-        if 'qa' in train.columns.to_list():
-            prompt = train.iloc[i]['qa']
-        else:
-            question = train['question'].iloc[i]
-            answer = train['solution'].iloc[i]
-            prompt = f"""Instruct: {question} Let's write a Python program.\nOutput:\n{answer}"""
-        inputs = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-        outputs = model(inputs)
-        for key, tensor in magnitude.items():
-            try:
-                param_dict[f"{key}.weight"] += tensor
-            except:
-                print(f'passed at {key}')
-    keys_to_remove = [key for key in param_dict if key.split('.weight')[0] not in magnitude]
-
-    for key in keys_to_remove:
-        del param_dict[key]
-
-    # create dictionary to store mask 
-    mask_dict = {}
+        save_json(f"{results_root}pre_results.json", eval_results)
 
 
-    for k, v in param_dict.items():
-        # don't count classifier layer
-        if "embed" in k:
-            if prune == False:
-                mask_dict[k] = torch.zeros_like(v).to(v.device)
-            else:
-                mask_dict[k] = torch.ones_like(v).to(v.device)
-
-        else:
-            if prune == False:
-                sizes = v.shape
-                num_params = v.numel()
-                keep_num = int(num_params * keep_ratio)
-                tensor = v.view(-1)
-                top_pos = torch.topk(torch.abs(tensor), keep_num, largest = largest)[1]
-                mask_dict[k] = torch.zeros_like(tensor, device=tensor.device)
-                mask_dict[k][top_pos] = 1
-                mask_dict[k] = mask_dict[k].reshape(v.shape).to(tensor.device)
-            else:
-                sizes = v.shape
-                num_params = v.numel()
-                keep_num = int(num_params * keep_ratio)
-                tensor = v.view(-1)
-                top_pos = torch.topk(torch.abs(tensor), keep_num, largest = largest)[1]
-                mask_dict[k] = torch.ones_like(tensor, device=tensor.device)
-                mask_dict[k][top_pos] = 0
-                mask_dict[k] = mask_dict[k].reshape(v.shape).to(tensor.device)
-
-    return mask_dict
-    
-def prune(bad_params, good_params, factor, return_good = False):
-    prune_params = {}
-    if return_good ==False:
-        for k, v in bad_params.items():
-            prune_params[k] = bad_params[k] - good_params[k]
-            indices = prune_params[k]!=-1
-            bad_indices = prune_params[k]==-1
-            prune_params[k] = indices + (bad_indices*factor)
-
-    else:
-        for k, v in bad_params.items():
-            prune_params[k] = good_params[k] - bad_params[k]
-            indices = prune_params[k]!=-1
-            good_indices = prune_params[k]==-1
-            prune_params[k] = indices + (good_indices*factor)
-    return prune_params
-
-def scale(good_params, factor):
-    prune_params = {}
-    for k, v in good_params.items():
-        good_indices = good_params[k]!=1
-        keep_indices = good_params[k]==1
-        prune_params[k] = keep_indices + (good_indices*factor)
-    return prune_params
-
-num_samples = args.num_samples
-num_repeats = 5
-if args.proportion is None:
-    good_percents = [.0001, .001, .005, .01, .025, .05, .1, .15]
-if args.proportion is not None:
-    good_percents = [args.proportion]
-scalar = args.scalar
-for dataset in dataset_list:
-    for repeat in range(0, num_repeats):
-        sampled_train = train.sample(n = num_samples, replace = True)
-        sampled_comparison = dataset.sample(n = num_samples, replace = True)
-        for good_percent in good_percents:
-            model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto", torch_dtype=torch.bfloat16)
+def run_post_prune_eval(
+    args,
+    model: nn.Module,
+    tokenizer,
+    train: pd.DataFrame,
+    val: pd.DataFrame | None,
+    results_root: str,
+    output_file: str,
+    dataset_name: str,
+    good_percent: float,
+    repeat: int,
+    num_samples: int,
+) -> None:
+    """Evaluate the pruned model and dump per-run JSONs / accuracy lines."""
+    if 'sgsm' in args.train_dataset:
+        assert val is not None
+        acc = evaluate_sgsm_few_shot(model, tokenizer, train, val, args.eval_dataset_subset)
+        n = min(args.eval_dataset_subset, len(val))
+        append_text(
+            output_file,
+            f"Average eval accuracy on {n} questions for pruning top {good_percent}% good "
+            f"parameters based on not being activated by {dataset_name} based on {num_samples} "
+            f"training samples and greedy decoding (few-shot): {acc}",
+        )
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            magnitude = {}
-            def getActivation(name):
-                # The hook function
-                def hook(module, input, output):
-                    activations = input[0]  # Get the input activations
-                    weights = module.weight.data  # Get the weights
-                    device = weights.device
-                    # Compute the norm of activations along dim=1
-                    activations_norm = activations.norm(p=2, dim=1).to(torch.bfloat16)
-                    # Multiply activations by the absolute value of weights
-                    modified_output = activations_norm.to(device) * torch.abs(weights)
-                    magnitude[name] = modified_output.detach()  # Store the modified output
-                # Return the hook function
-                return hook
-            
-            for name, module in model.named_modules():
-                if (isinstance(module, (nn.Linear))):
-                    hook_fn = getActivation(name)  # Get the hook function
-                    module.register_forward_hook(hook_fn)  # Register the hook function
-            good_params = find_good_params(model, sampled_train, keep_ratio=good_percent, prune = True, largest = True, num_samples = num_samples)
-            torch.cuda.empty_cache()
-            if 'Bad' in dataset.name:    
-                comparison_params = find_params(model, sampled_comparison, keep_ratio=good_percent, prune = True, largest = True, num_samples = num_samples)
-            else:
-                comparison_params = find_good_params(model, sampled_comparison, keep_ratio=good_percent, prune = True, largest = True, num_samples = num_samples)
+        results = run_lm_eval(
+            model, tokenizer, args.eval_datasets, args.eval_dataset_subset, args.random_state,
+        )
+        save_json(
+            f"{results_root}{dataset_name}_calculate{good_percent}_run{repeat}.json",
+            results,
+        )
 
-            prune_params = prune(comparison_params, good_params, scalar, return_good = True)
-            del good_params
-            del comparison_params
-            for key, tensor in prune_params.items():
-                device = model.state_dict()[key].device
-                tensor = tensor.to(device)
-                model.state_dict()[key]*=tensor
-                
-            del prune_params
-            def remove_hooks(model):
-                # Function to remove all hooks
-                for name, module in model.named_modules():
-                    # Check if the module has any forward hooks
-                    if hasattr(module, "_forward_hooks") and len(module._forward_hooks) > 0:
-                        # Remove all forward hooks
-                        module._forward_hooks.clear()
-        
-            remove_hooks(model)
-            if 'sgsm' in args.train_dataset:
-                prune_solve = []
-                prune_code = []
-                prune_solutions = []
-                for i in range(0, min(args.eval_dataset_subset, len(val))):
-                    # Format the prompt
-                    prompts = []
-                    questions = []
-                    final_question = val.iloc[i]['question']
-                    final_answer = val.iloc[i]['answer']
-                    final_prompt = f"""Instruct: {final_question} Let's write a Python program.\nOutput:"""
-    
-                    for j in range(0, 8):
-                        question = train['question'].iloc[j]
-                        questions.append(question)
-                        answer = train['solution'].iloc[j]
-                        prompt = f"""Instruct: {question} Let's write a Python program.\nOutput:\n{answer}"""
-                        if prompt not in prompts:
-                            prompts.append(prompt)
-    
-                    prompts.append(final_prompt)
-                    formatted_prompt = "\n\n".join(prompts)
-                    #Query the model 
-                    inputs = tokenizer.encode(formatted_prompt, return_tensors="pt").to(model.device)
-                    model_answer = None
-                    #output = model.generate(inputs, max_new_tokens = 150, temperature = .7, do_sample = True)
-                    output = model.generate(inputs, max_new_tokens = 150)
-                    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-                    # Split the generated text by the prompt to extract the newly generated part
-                    generated_text_parts = generated_text.split(final_prompt)
-                    solution_text = generated_text_parts[-1].strip()
-                    prune_solutions.append(solution_text)
-                    if "Instruct:" in solution_text:
-                        solution_text = solution_text.split("Instruct:")[0] # Split up a generation that contains more than one question
-                    if "print" in solution_text:
-                        solution_text = solution_text.split("print")[0] # Split up a generation that contains a print statement
-                    if "Student:" in solution_text:
-                        solution_text = solution_text.split("Student:")[0] # Split up a generation that contains more than one question
-                    if "Output:" in solution_text:
-                        solution_text = solution_text.split("Output:")[0] # Split up a generation that contains more than one question
-                    if "#TODO" in solution_text:
-                        solution_text = solution_text.split("#TODO")[0] # Split up a generation that contains more than one question
-                    #solutions.append(solution_text)
-                    if 'return result' in solution_text:
-                        # Split the string on 'return result' but keep 'return result' in the result
-                        parts = re.split(r'(return result)', solution_text)
-    
-                        # Rejoin the parts correctly
-                        solution_text = parts[0] + parts[1]
-                    try:
-                        exec(solution_text)
-                        model_answer = solution()
-                        prune_code.append(1)
-                        model_answer = float(model_answer)
-                        if model_answer != final_answer:
-                            prune_solve.append(0)
-    
-                        if model_answer == final_answer:
-                            prune_solve.append(1)
-    
-                    except:
-                        prune_code.append(0)
-                        prune_solve.append(0)
-    
-                with open(output_file, "a") as f:  # Open the file in append mode ("a")
-                        f.write(f"Average eval accuracy on {min(args.eval_dataset_subset, len(val))} questions for pruning top {good_percent}% good parameters based on not being activated by {dataset.name} based on {num_samples} training samples and greedy decoding (few-shot): {np.mean(prune_solve)}\n")  
-                torch.cuda.empty_cache()
-                task_manager = lm_eval.tasks.TaskManager()
-                #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
-                # Setting `task_manager` to the one above is optional and should generally be done
-                # if you want to include tasks from paths other than ones in `lm_eval/tasks`.
-                # `simple_evaluate` will instantiate its own task_manager if it is set to None here.
-                results = lm_eval.simple_evaluate( # call simple_evaluate
-                    model = 'hf',
-                    model_args = {'pretrained':model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
-                    tasks=args.eval_datasets,
-                    task_manager=task_manager,
-                    log_samples = False, 
-                    batch_size = 'auto:4'
+    if args.train_lm_eval_task is not None:
+        train_results = run_lm_eval(
+            model, tokenizer, args.train_lm_eval_task,
+            args.eval_dataset_subset, args.random_state,
+        )
+        save_json(
+            f"{results_root}{dataset_name}_calculate{good_percent}_run{repeat}_train_task.json",
+            train_results,
+        )
+        eval_results = run_lm_eval(
+            model, tokenizer, args.eval_datasets,
+            args.eval_dataset_subset, args.random_state,
+        )
+        save_json(
+            f"{results_root}{dataset_name}_calculate{good_percent}_run{repeat}.json",
+            eval_results,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+def default_keep_ratios() -> list[float]:
+    """Top-k ratios swept when `proportion` is not specified in the config."""
+    return [0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.15]
+
+
+def main() -> None:
+    args = load_config()
+
+    train, val = load_train_dataset(args)
+    calibration_datasets = load_calibration_datasets(args)
+
+    results_root = make_results_root(args)
+    output_file = f"{args.save_path}/eval_results/{args.model}/{args.text_file}"
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+
+    if args.pre_train_eval:
+        model = load_model(args.model)
+        run_pre_train_eval(args, model, tokenizer, train, val, results_root, output_file)
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    keep_ratios = [args.proportion] if args.proportion is not None else default_keep_ratios()
+    num_samples = args.num_samples
+
+    for calibration_dataset in calibration_datasets:
+        dataset_name = calibration_dataset.name
+        calib_df = calibration_dataset.data
+        for repeat in range(args.num_repeats):
+            sampled_train = train.sample(n=num_samples, replace=True)
+            sampled_calib = calib_df.sample(n=num_samples, replace=True)
+
+            for keep_ratio in keep_ratios:
+                # Reload a fresh model for every combo so pruning never accumulates across runs.
+                model = load_model(args.model)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                prune_math_specific(
+                    model=model,
+                    tokenizer=tokenizer,
+                    train_df=sampled_train,
+                    calib_df=sampled_calib,
+                    calib_name=dataset_name,
+                    keep_ratio=keep_ratio,
+                    num_samples=num_samples,
+                    factor=args.scalar,
                 )
-                results_path = f"{args.save_path}/eval_results/{args.model}/{dataset.name}_calculate{good_percent}_run{repeat}.json"
-                os.makedirs(os.path.dirname(results_path), exist_ok=True)
-                with open(results_path, "w") as outfile: 
-                    json.dump(results['results'], outfile)
-            if args.train_lm_eval_task is not None:
-                task_manager = lm_eval.tasks.TaskManager()
-                #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
-                # Setting `task_manager` to the one above is optional and should generally be done
-                # if you want to include tasks from paths other than ones in `lm_eval/tasks`.
-                # `simple_evaluate` will instantiate its own task_manager if it is set to None here.
-                results = lm_eval.simple_evaluate( # call simple_evaluate
-                    model = 'hf',
-                    model_args = {'pretrained':model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
-                    tasks=args.train_lm_eval_task,
-                    task_manager=task_manager,
-                    log_samples = False, 
-                    batch_size = 'auto:4',
-                    limit = args.eval_dataset_subset, 
-                    random_seed = args.random_state
+
+                run_post_prune_eval(
+                    args, model, tokenizer, train, val, results_root, output_file,
+                    dataset_name=dataset_name, good_percent=keep_ratio,
+                    repeat=repeat, num_samples=num_samples,
                 )
-                results_path = f"{args.save_path}/eval_results/{args.model}/{dataset.name}_calculate{good_percent}_run{repeat}_train_task.json"
-                os.makedirs(os.path.dirname(results_path), exist_ok=True)
-                with open(results_path, "w") as outfile: 
-                    json.dump(results['results'], outfile)
-                    
-                results = lm_eval.simple_evaluate( # call simple_evaluate
-                    model = 'hf',
-                    model_args = {'pretrained':model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
-                    tasks=args.eval_datasets,
-                    task_manager=task_manager,
-                    log_samples = False, 
-                    batch_size = 'auto:4'
-                )
-                results_path = f"{args.save_path}/eval_results/{args.model}/{dataset.name}_calculate{good_percent}_run{repeat}.json"
-                os.makedirs(os.path.dirname(results_path), exist_ok=True)
-                with open(results_path, "w") as outfile: 
-                    json.dump(results['results'], outfile)
-                        
-            del model
+
+                del model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+
+if __name__ == '__main__':
+    main()
