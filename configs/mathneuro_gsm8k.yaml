@@ -26,4 +26,4 @@ ea_pop_size: 12
 ea_n_gen: 30
 ea_eval_samples: 32
 
-batch_size: 1
+batch_size: 16
