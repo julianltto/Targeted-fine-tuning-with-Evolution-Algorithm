@@ -157,7 +157,7 @@ def evaluate_sgsm_few_shot(
 def run_lm_eval(
     model: nn.Module,
     tokenizer,
-    tasks,
+    tasks: str | list[str],
     eval_subset: int,
     random_state: int,
     batch_size: int | str = 1,
@@ -165,10 +165,11 @@ def run_lm_eval(
     n_samples_to_dump: int = 5,
 ) -> dict:
     task_manager = TaskManager()
+    task_list: list[Any] = [tasks] if isinstance(tasks, str) else list(tasks)
     results = simple_evaluate(
         model='hf',
         model_args={'pretrained': model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
-        tasks=tasks,
+        tasks=task_list,
         task_manager=task_manager,
         log_samples=sample_dump_path is not None,
         batch_size=batch_size,
