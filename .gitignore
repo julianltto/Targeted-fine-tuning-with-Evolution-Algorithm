@@ -167,3 +167,6 @@ mathneuro.pdf
 # conifg
 .vscode
 .claude
+
+# Experiment outputs
+results/

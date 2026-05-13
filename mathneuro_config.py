@@ -48,7 +48,7 @@ def get_config_path(argv):
         return argv[1]
     if len(argv) == 3 and argv[1] in {"--config", "-c"}:
         return argv[2]
-    raise SystemExit("Usage: python MathNeuro.py path/to/config.yaml\n   or: python MathNeuro.py --config path/to/config.yaml")
+    raise SystemExit("Usage: python run.py path/to/config.yaml\n   or: python run.py --config path/to/config.yaml")
 
 
 def read_yaml_config(config_path):

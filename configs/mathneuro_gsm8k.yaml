@@ -1,22 +1,29 @@
 model: meta-llama/Llama-3.2-1B-Instruct
-save_path: ./smoke_out
+save_path: ./results
 train_dataset: data/gsm8k.csv
 eval_datasets:
   - race
   - mmlu
 calibration_datasets:
   - data/race.csv
-  - data/mmlu.csv
 calibration_dataset_names:
   - Race
-  - MMLU
 
-text_file: smoke_results.txt
-pre_train_eval: false
-num_repeats: 1
-proportion: 0.15
-num_samples: 16
-eval_dataset_subset: 8
+text_file: results.txt
+pre_train_eval: False
+num_repeats: 3
+proportion: [0.1]
+num_samples: 64
+eval_dataset_subset: 200
 train_lm_eval_task: gsm8k_cot
 random_state: 42
 scalar: 0
+
+with_ea: True
+ea_mode: scale        
+ea_max_scale: 0.2      
+ea_pop_size: 12
+ea_n_gen: 30
+ea_eval_samples: 32
+
+batch_size: 1

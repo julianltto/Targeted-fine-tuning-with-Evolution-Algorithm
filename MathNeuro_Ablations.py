@@ -1,21 +1,3 @@
-"""
-Refactored MathNeuro ablation pipeline.
-
-This is the ablation counterpart to MathNeuro.py: same data loading and evaluation, but with two
-control conditions for the pruning mask:
-
-    `top_good` : Prune ALL math-important positions (no intersection with the calibration mask).
-                 Tests whether the *math-specific* set matters, or whether pruning any math-active
-                 weight is enough.
-    `random`   : Compute the math-specific positions as in MathNeuro.py, count how many there are
-                 per layer, then prune the same *number* of weights chosen uniformly at random.
-                 Tests whether the specific positions matter, or whether any random subset of the
-                 same size would hurt math just as much.
-
-Both ablations reuse mathneuro.core for hooks / importance / top-k. Heavy IO / SGSM eval / lm_eval
-helpers are imported from MathNeuro.py to avoid duplication; this file only adds the ablation-
-specific mask construction and orchestration.
-"""
 from __future__ import annotations
 
 from typing import Callable
@@ -25,7 +7,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
 
-from mathneuro_config import load_config
+from mathneuro.config import load_config
 from mathneuro.core import (
     apply_mask_to_model,
     compute_importance,
@@ -35,7 +17,7 @@ from mathneuro.core import (
     remove_hooks,
     top_k_mask,
 )
-from MathNeuro import (
+from run import (
     append_text,
     evaluate_sgsm_few_shot,
     load_calibration_datasets,
@@ -47,21 +29,11 @@ from MathNeuro import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Ablation-specific mask construction
-# ---------------------------------------------------------------------------
-
 def build_top_good_mask(
     math_important: dict[str, torch.Tensor],
     factor: float,
     exclude_substring: str = 'embed',
 ) -> dict[str, torch.Tensor]:
-    """
-    `top_good` ablation: prune ALL math-important positions (ignore the calibration mask).
-
-    Returns a multiplicative mask where math-important positions are set to `factor` (0 prunes
-    them) and every other position is 1.
-    """
     masks: dict[str, torch.Tensor] = {}
     for name, math_mask in math_important.items():
         if exclude_substring in name:
@@ -81,13 +53,6 @@ def build_random_mask(
     exclude_substring: str = 'embed',
     generator: torch.Generator | None = None,
 ) -> dict[str, torch.Tensor]:
-    """
-    `random` ablation: for each layer, count the number of math-specific positions
-    (`math & ~calib`) and prune the same number of *randomly chosen* positions instead.
-
-    Returns a multiplicative mask shaped like each weight, with that many entries set to `factor`
-    (uniformly at random) and the rest set to 1.
-    """
     masks: dict[str, torch.Tensor] = {}
     for name, math_mask in math_important.items():
         if exclude_substring in name:
@@ -106,10 +71,6 @@ def build_random_mask(
     return masks
 
 
-# ---------------------------------------------------------------------------
-# Pruning pipelines (uses mathneuro.core)
-# ---------------------------------------------------------------------------
-
 def _pick_calib_prompt_fn(df: pd.DataFrame, dataset_name: str) -> Callable[[pd.Series], str]:
     """Same convention as MathNeuro.py: datasets named "Bad…" use column '0', others use 'qa'."""
     if 'Bad' in dataset_name:
@@ -125,10 +86,6 @@ def _compute_math_and_calib_importance(
     calib_name: str,
     num_samples: int,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    """
-    Run forward passes on math and calibration data with hooks attached, return both importance
-    score dicts. Hooks are always removed before returning, even on error.
-    """
     magnitude, handles = register_activation_hooks(model)
     try:
         math_scores = compute_importance(
@@ -156,14 +113,6 @@ def prune_ablation(
     method: str,
     generator: torch.Generator | None = None,
 ) -> None:
-    """
-    Run the ablation pruning end-to-end. The `method` argument selects which baseline mask to
-    apply:
-        - 'top_good': prune all math-important positions.
-        - 'random'  : prune the same number of randomly chosen positions as math-specific.
-
-    All other dataset / hooking logic mirrors MathNeuro.prune_math_specific.
-    """
     math_scores, calib_scores = _compute_math_and_calib_importance(
         model, tokenizer, train_df, calib_df, calib_name, num_samples,
     )
@@ -180,10 +129,6 @@ def prune_ablation(
     apply_mask_to_model(model, mask)
 
 
-# ---------------------------------------------------------------------------
-# Evaluation orchestration
-# ---------------------------------------------------------------------------
-
 # lm_eval batch size used by the ablation script. Matches the original argparse-based code.
 _LM_EVAL_BATCH_SIZE: int | str = 'auto:4'
 
@@ -197,7 +142,6 @@ def run_pre_train_eval_ablation(
     results_root: str,
     output_file: str,
 ) -> None:
-    """Optional baseline evaluation before any ablation pruning runs."""
     if 'sgsm' in args.train_dataset:
         assert val is not None, "SGSM training set must produce a validation split."
         acc = evaluate_sgsm_few_shot(model, tokenizer, train, val, args.eval_dataset_subset)
@@ -241,10 +185,6 @@ def run_post_prune_eval_ablation(
     repeat: int,
     num_samples: int,
 ) -> None:
-    """
-    Evaluate the ablation-pruned model and dump per-run JSONs / accuracy lines. Output paths
-    include a `/{method}/` subdirectory so the two ablations don't overwrite each other.
-    """
     method_root = f"{results_root}{method}/"
 
     if 'sgsm' in args.train_dataset:
@@ -287,17 +227,11 @@ def run_post_prune_eval_ablation(
         )
 
 
-# ---------------------------------------------------------------------------
-# Main pipeline
-# ---------------------------------------------------------------------------
-
 def default_keep_ratios() -> list[float]:
-    """Top-k ratios swept when `proportion` is not specified in the config."""
     return [0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.15]
 
 
 def default_ablation_methods() -> list[str]:
-    """Ablation methods compared in the original script."""
     return ['random', 'top_good']
 
 
