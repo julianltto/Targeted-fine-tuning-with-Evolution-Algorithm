@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math as _math
 from typing import Callable
 
 import numpy as np
@@ -86,8 +87,12 @@ def _build_problem_class():
             layer_names: list[str],
             weight_backup: dict[str, torch.Tensor],
             eval_fn: Callable[[nn.Module], tuple[float, float]],
+            mode: str = 'prune',
+            max_scale: float = 0.1,
             exclude_substring: str = 'embed',
         ):
+            if mode not in {'prune', 'scale'}:
+                raise ValueError(f"mode must be 'prune' or 'scale', got {mode!r}")
             super().__init__(
                 n_var=len(layer_names),
                 n_obj=2,
@@ -101,6 +106,8 @@ def _build_problem_class():
             self.layer_names = layer_names
             self.weight_backup = weight_backup
             self.eval_fn = eval_fn
+            self.mode = mode
+            self.max_scale = max_scale
             self.exclude_substring = exclude_substring
 
         def _evaluate(self, x, out, *args, **kwargs):
@@ -117,12 +124,19 @@ def _build_problem_class():
                     math_only = (math_mask & (~calib_mask)).to(params[name].device)
                     if not math_only.any():
                         continue
-                    target = 1.0 - strengths.get(name, 0.0)
+                    strength = strengths.get(name, 0.0)
+                    if self.mode == 'prune':
+                        target = 1.0 - strength
+                    else:
+                        target = 1.0 + self.max_scale * strength
                     params[name][math_only] = params[name][math_only] * target
             try:
                 math_acc, general_acc = self.eval_fn(self.model)
             finally:
                 restore_weights(self.model, self.weight_backup)
+
+            if not (_math.isfinite(math_acc) and _math.isfinite(general_acc)):
+                math_acc, general_acc = 0.0, -1e3
 
             out["F"] = [-float(math_acc), -float(general_acc)]
 
@@ -136,6 +150,8 @@ def run_ea_search(
     eval_fn: Callable[[nn.Module], tuple[float, float]],
     pop_size: int = 30,
     n_gen: int = 30,
+    mode: str = 'prune',
+    max_scale: float = 0.1,
     exclude_substring: str = 'embed',
     seed: int = 42,
     verbose: bool = True,
@@ -177,6 +193,8 @@ def run_ea_search(
         layer_names=layer_names,
         weight_backup=weight_backup,
         eval_fn=eval_fn,
+        mode=mode,
+        max_scale=max_scale,
         exclude_substring=exclude_substring,
     )
 

@@ -31,6 +31,7 @@ class MathNeuroConfig:
     ea_pop_size: int = 20
     ea_n_gen: int = 15
     ea_eval_samples: int = 30
+    ea_fitness_version: str = 'gsm8k_cot_flex_v2'
 
     batch_size: int | str = 1
 
@@ -78,6 +79,7 @@ CONFIG: MathNeuroConfig = MathNeuroConfig(
     eval_dataset_subset=8,
     train_lm_eval_task="gsm8k_cot",
     with_ea=True,
+    ea_fitness_version='gsm8k_cot_flex_v2',
 )
 
 

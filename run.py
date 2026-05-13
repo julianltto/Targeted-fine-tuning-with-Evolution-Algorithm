@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import pickle
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, cast
@@ -11,6 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from lm_eval import simple_evaluate
@@ -42,9 +44,6 @@ class CalibrationDataset:
 
 
 def load_train_dataset(args) -> tuple[pd.DataFrame, pd.DataFrame | None]:
-    """
-    For SGSM we also split off a validation set used by the SGSM-specific few-shot Python-program evaluation.
-    """
     if 'sgsm' in args.train_dataset:
         df = pd.read_csv(args.train_dataset)
         df = df[df['subset'] == 'sgsm_train']
@@ -103,10 +102,6 @@ def run_solution_code(solution_text: str) -> Any:
 
 
 def clean_solution_text(solution_text: str) -> str:
-    """
-    Trim everything after the first occurrence of any truncation marker so we only execute the
-    first solution() body, then keep `return result` if present.
-    """
     for marker in _SOLUTION_TRUNCATE_MARKERS:
         if marker in solution_text:
             solution_text = solution_text.split(marker)[0]
@@ -117,7 +112,6 @@ def clean_solution_text(solution_text: str) -> str:
 
 
 def build_few_shot_prompt(train: pd.DataFrame, final_question: str, k: int = 8) -> str:
-    """Build a k-shot prompt: k (question, solution) demonstrations followed by the final question."""
     demos: list[str] = []
     for j in range(k):
         question = train['question'].iloc[j]
@@ -169,6 +163,8 @@ def run_lm_eval(
     eval_subset: int,
     random_state: int,
     batch_size: int | str = 1,
+    sample_dump_path: str | None = None,
+    n_samples_to_dump: int = 5,
 ) -> dict:
     task_manager = TaskManager()
     results = simple_evaluate(
@@ -176,14 +172,62 @@ def run_lm_eval(
         model_args={'pretrained': model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
         tasks=tasks,
         task_manager=task_manager,
-        log_samples=False,
+        log_samples=sample_dump_path is not None,
         batch_size=batch_size,
         limit=eval_subset,
         random_seed=random_state,
     )
     if results is None:
         raise RuntimeError('lm_eval.simple_evaluate returned None.')
+
+    if sample_dump_path and 'samples' in results:
+        dump: dict[str, list[dict[str, Any]]] = {}
+        for task_name, samples in results['samples'].items():
+            picked = []
+            for s in samples[:n_samples_to_dump]:
+                prompt = ''
+                if s.get('arguments'):
+                    arg0 = s['arguments'][0]
+                    prompt = arg0[0] if isinstance(arg0, (list, tuple)) else str(arg0)
+                picked.append({
+                    'prompt_tail': prompt[-600:],
+                    'gold': s.get('target', ''),
+                    'generated': s.get('resps', [[None]])[0][0] if s.get('resps') else None,
+                    'filtered': s.get('filtered_resps', [None])[0] if s.get('filtered_resps') else None,
+                    'exact_match': s.get('exact_match'),
+                })
+            dump[task_name] = picked
+        save_json(sample_dump_path, dump)
+
     return results['results']
+
+
+def ea_checkpoint_path(
+    results_root: str,
+    dataset_name: str,
+    keep_ratio: float,
+    repeat: int,
+) -> str:
+    return f"{results_root}{dataset_name}_calculate{keep_ratio}_run{repeat}_ea_ckpt.pkl"
+
+
+def save_ea_checkpoint(path: str, payload: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'wb') as f:
+        pickle.dump(payload, f)
+
+
+def try_load_ea_checkpoint(path: str, expected: dict[str, Any]) -> dict[str, Any] | None:
+    if not os.path.exists(path):
+        return None
+    with open(path, 'rb') as f:
+        payload = pickle.load(f)
+    cfg = payload.get('config', {})
+    for k, v in expected.items():
+        if cfg.get(k) != v:
+            print(f"[EA ckpt] {path} skipped: {k}={cfg.get(k)} != {v}")
+            return None
+    return payload
 
 
 def append_text(output_file: str, line: str) -> None:
@@ -275,7 +319,7 @@ def compute_prune_stats(
         }
 
     return {
-        "effective_prune_ratio": weighted_pruned / max(total_params, 1),
+        "effective_intervention_strength": weighted_pruned / max(total_params, 1),
         "math_only_ratio": total_math_only / max(total_params, 1),
         "total_params": total_params,
         "per_layer": per_layer,
@@ -295,6 +339,8 @@ def search_pareto_front(
     n_gen: int = 15,
     eval_samples: int = 30,
     eval_batch_size: int = 16,
+    mode: str = 'prune',
+    max_scale: float = 0.1,
 ) -> tuple[
     list[dict[str, float]],
     np.ndarray,
@@ -323,6 +369,7 @@ def search_pareto_front(
         model, math_mask, calib_mask,
         make_eval_fn(tokenizer, train_df, calib_df, n=eval_samples, batch_size=eval_batch_size),
         pop_size=pop_size, n_gen=n_gen, seed=seed,
+        mode=mode, max_scale=max_scale,
     )
     if result.F is None or result.X is None:
         raise RuntimeError("EA search returned no Pareto front.")
@@ -398,24 +445,106 @@ def loglike(model, tokenizer, df, n=50, batch_size=16):
         labels = labels.to(model.device)
 
         logits = model(input_ids, attention_mask=attn_mask).logits
-        shift_logits = logits[:, :-1, :].float()
-        shift_labels = labels[:, 1:]
-        valid = shift_labels.ne(-100)
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
 
-        safe_labels = shift_labels.clamp(min=0).unsqueeze(-1)
-        token_logp = torch.log_softmax(shift_logits, dim=-1).gather(-1, safe_labels).squeeze(-1)
-        token_logp = token_logp * valid
-
-        total_loglike += token_logp.sum().item()
-        total_tokens += valid.sum().item()
-
+        loss_sum = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+            reduction='sum',
+        )
+        total_loglike += -loss_sum.item()
+        total_tokens += shift_labels.ne(-100).sum().item()
     return total_loglike / max(total_tokens, 1)
+
+
+_LM_EVAL_TASK_MANAGER: Any = None
+
+
+def _get_task_manager():
+    global _LM_EVAL_TASK_MANAGER
+    if _LM_EVAL_TASK_MANAGER is None:
+        _LM_EVAL_TASK_MANAGER = TaskManager()
+    return _LM_EVAL_TASK_MANAGER
+
+
+@torch.no_grad()
+def gsm8k_cot_acc(
+    model: nn.Module,
+    tokenizer,
+    limit: int = 32,
+    batch_size: int = 8,
+    seed: int = 42,
+) -> float:
+    results = simple_evaluate(
+        model='hf',
+        model_args={'pretrained': model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
+        tasks='gsm8k_cot',
+        task_manager=_get_task_manager(),
+        log_samples=False,
+        batch_size=batch_size,
+        limit=limit,
+        random_seed=seed,
+        verbosity='ERROR',
+    )
+    if results is None:
+        return 0.0
+    return float(results['results']['gsm8k_cot'].get('exact_match,strict-match', 0.0))
+
+
+def dump_sample_generations(
+    model: nn.Module,
+    tokenizer,
+    n: int = 5,
+    task: str = 'gsm8k_cot',
+    out_path: str | None = None,
+    batch_size: int = 4,
+    seed: int = 42,
+) -> list[dict]:
+    results = simple_evaluate(
+        model='hf',
+        model_args={'pretrained': model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
+        tasks=task,
+        task_manager=_get_task_manager(),
+        log_samples=True,
+        batch_size=batch_size,
+        limit=n,
+        random_seed=seed,
+        verbosity='ERROR',
+    )
+    if results is None or 'samples' not in results:
+        print("[dump] no samples returned")
+        return []
+
+    samples = results['samples'].get(task, [])
+    for i, s in enumerate(samples):
+        prompt = ''
+        if s.get('arguments'):
+            arg0 = s['arguments'][0]
+            prompt = arg0[0] if isinstance(arg0, (list, tuple)) else str(arg0)
+        gen = s.get('resps', [[None]])[0][0]
+        gold = s.get('target', '?')
+        print(f"\n=== {task} sample {i} ===")
+        print(f"--- PROMPT (last 400 chars) ---\n{prompt[-400:]}")
+        print(f"--- GOLD ---\n{gold}")
+        print(f"--- GENERATED ---\n{gen}")
+
+    if out_path:
+        save_json(out_path, samples)
+        print(f"\n[dump] {len(samples)} samples saved to {out_path}")
+    return samples
 
 
 def make_eval_fn(tokenizer, math_eval_df, general_eval_df, n: int = 50, batch_size: int = 16):
     def eval_fn(model):
-        math_score = loglike(model, tokenizer, math_eval_df, n=n, batch_size=batch_size)
-        general_score = loglike(model, tokenizer, general_eval_df, n=n, batch_size=batch_size)
+        math_score = gsm8k_cot_acc(
+            model, tokenizer, limit=n, batch_size=min(batch_size, 8),
+        )
+        general_score = loglike(
+            model, tokenizer, general_eval_df,
+            n=n, batch_size=batch_size,
+        )
         return math_score, general_score
     return eval_fn
 
@@ -448,6 +577,7 @@ def run_pre_train_eval(
             model, tokenizer, args.train_lm_eval_task,
             args.eval_dataset_subset, args.random_state,
             batch_size=args.batch_size,
+            sample_dump_path=f"{results_root}pre_results_train_task_samples.json",
         )
         save_json(f"{results_root}pre_results_train_task.json", train_results)
 
@@ -455,6 +585,7 @@ def run_pre_train_eval(
             model, tokenizer, args.eval_datasets,
             args.eval_dataset_subset, args.random_state,
             batch_size=args.batch_size,
+            sample_dump_path=f"{results_root}pre_results_eval_samples.json",
         )
         save_json(f"{results_root}pre_results.json", eval_results)
 
@@ -494,24 +625,22 @@ def run_post_prune_eval(
         )
 
     if args.train_lm_eval_task is not None:
+        tag = f"{dataset_name}_calculate{good_percent}_run{repeat}"
         train_results = run_lm_eval(
             model, tokenizer, args.train_lm_eval_task,
             args.eval_dataset_subset, args.random_state,
             batch_size=args.batch_size,
+            sample_dump_path=f"{results_root}{tag}_train_task_samples.json",
         )
-        save_json(
-            f"{results_root}{dataset_name}_calculate{good_percent}_run{repeat}_train_task.json",
-            train_results,
-        )
+        save_json(f"{results_root}{tag}_train_task.json", train_results)
+
         eval_results = run_lm_eval(
             model, tokenizer, args.eval_datasets,
             args.eval_dataset_subset, args.random_state,
             batch_size=args.batch_size,
+            sample_dump_path=f"{results_root}{tag}_eval_samples.json",
         )
-        save_json(
-            f"{results_root}{dataset_name}_calculate{good_percent}_run{repeat}.json",
-            eval_results,
-        )
+        save_json(f"{results_root}{tag}.json", eval_results)
 
 
 def main():
@@ -554,20 +683,51 @@ def main():
                     torch.cuda.empty_cache()
 
                 if args.with_ea:
-                    strengths_list, scores, math_mask, calib_mask = search_pareto_front(
-                        model=model,
-                        tokenizer=tokenizer,
-                        train_df=sampled_train,
-                        calib_df=sampled_calib,
-                        calib_name=dataset_name,
-                        keep_ratio=keep_ratio,
-                        num_samples=num_samples,
-                        seed=args.random_state,
-                        pop_size=args.ea_pop_size,
-                        n_gen=args.ea_n_gen,
-                        eval_samples=args.ea_eval_samples,
-                        eval_batch_size=int(args.batch_size) if isinstance(args.batch_size, int) or (isinstance(args.batch_size, str) and args.batch_size.isdigit()) else 16,
-                    )
+                    ckpt_path = ea_checkpoint_path(results_root, dataset_name, keep_ratio, repeat)
+                    ckpt_config = {
+                        'model': args.model,
+                        'keep_ratio': keep_ratio,
+                        'num_samples': num_samples,
+                        'seed': args.random_state,
+                        'pop_size': args.ea_pop_size,
+                        'n_gen': args.ea_n_gen,
+                        'eval_samples': args.ea_eval_samples,
+                        'mode': args.ea_mode,
+                        'max_scale': args.ea_max_scale,
+                        'fitness_version': args.ea_fitness_version,
+                    }
+                    cached = try_load_ea_checkpoint(ckpt_path, ckpt_config)
+                    if cached is not None:
+                        print(f"[EA ckpt] loaded {ckpt_path}")
+                        strengths_list = cached['strengths_list']
+                        scores = cached['scores']
+                        math_mask = cached['math_mask']
+                        calib_mask = cached['calib_mask']
+                    else:
+                        strengths_list, scores, math_mask, calib_mask = search_pareto_front(
+                            model=model,
+                            tokenizer=tokenizer,
+                            train_df=sampled_train,
+                            calib_df=sampled_calib,
+                            calib_name=dataset_name,
+                            keep_ratio=keep_ratio,
+                            num_samples=num_samples,
+                            seed=args.random_state,
+                            pop_size=args.ea_pop_size,
+                            n_gen=args.ea_n_gen,
+                            eval_samples=args.ea_eval_samples,
+                            eval_batch_size=int(args.batch_size) if isinstance(args.batch_size, int) or (isinstance(args.batch_size, str) and args.batch_size.isdigit()) else 16,
+                            mode=args.ea_mode,
+                            max_scale=args.ea_max_scale,
+                        )
+                        save_ea_checkpoint(ckpt_path, {
+                            'config': ckpt_config,
+                            'strengths_list': strengths_list,
+                            'scores': scores,
+                            'math_mask': math_mask,
+                            'calib_mask': calib_mask,
+                        })
+                        print(f"[EA ckpt] saved {ckpt_path}")
                     weight_snapshot = backup_weights(model)
                     for point_idx, strengths in enumerate(strengths_list):
                         math_score, general_score = scores[point_idx]
@@ -577,8 +737,8 @@ def main():
                             output_file,
                             f"[EA point {point_idx}] mode={args.ea_mode} "
                             f"keep_ratio={keep_ratio} calib={dataset_name} "
-                            f"math_loglike={math_score:.4f} general_loglike={general_score:.4f} "
-                            f"intervention_ratio={stats['effective_prune_ratio']:.4f}",
+                            f"math_acc={math_score:.4f} general_loglike={general_score:.4f} "
+                            f"intervention_strength={stats['effective_intervention_strength']:.4f}",
                         )
 
                         save_json(
@@ -589,9 +749,9 @@ def main():
                                 "max_scale": args.ea_max_scale,
                                 "keep_ratio": keep_ratio,
                                 "calib_dataset": dataset_name,
-                                "math_loglike": float(math_score),
+                                "math_acc": float(math_score),
                                 "general_loglike": float(general_score),
-                                "effective_intervention_ratio": stats["effective_prune_ratio"],
+                                "effective_intervention_strength": stats["effective_intervention_strength"],
                                 "math_only_ratio": stats["math_only_ratio"],
                                 "total_params": stats["total_params"],
                                 "strengths": strengths,
