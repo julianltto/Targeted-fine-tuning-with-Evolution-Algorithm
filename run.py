@@ -24,7 +24,6 @@ from mathneuro import (
     backup_weights,
     build_intervention_mask_per_layer,
     build_prune_mask,
-    build_prune_mask_per_layer,
     compute_importance,
     make_calibration_prompt_fn,
     make_math_prompt_fn,
@@ -33,7 +32,6 @@ from mathneuro import (
     restore_weights,
     top_k_mask,
     run_ea_search,
-    format_pareto_front,
 )
 
 
@@ -374,13 +372,13 @@ def search_pareto_front(
     if result.F is None or result.X is None:
         raise RuntimeError("EA search returned no Pareto front.")
 
-    F = -result.F                     
-    X = result.X                       
+    pareto_F = -result.F
+    pareto_X = result.X
     strengths_list = [
-        {layer_names[j]: float(X[i, j]) for j in range(len(layer_names))}
-        for i in range(X.shape[0])
+        {layer_names[j]: float(pareto_X[i, j]) for j in range(len(layer_names))}
+        for i in range(pareto_X.shape[0])
     ]
-    return strengths_list, F, math_mask, calib_mask
+    return strengths_list, pareto_F, math_mask, calib_mask
 
 _QA_SPLIT_MARKERS: tuple[str, ...] = (
     "A: Let's think step by step.\n",
@@ -480,7 +478,7 @@ def gsm8k_cot_acc(
     results = simple_evaluate(
         model='hf',
         model_args={'pretrained': model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
-        tasks='gsm8k_cot',
+        tasks=['gsm8k_cot'],
         task_manager=_get_task_manager(),
         log_samples=False,
         batch_size=batch_size,
@@ -505,7 +503,7 @@ def dump_sample_generations(
     results = simple_evaluate(
         model='hf',
         model_args={'pretrained': model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
-        tasks=task,
+        tasks=[task],
         task_manager=_get_task_manager(),
         log_samples=True,
         batch_size=batch_size,
