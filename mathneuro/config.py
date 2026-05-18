@@ -32,6 +32,7 @@ class MathNeuroConfig:
     ea_n_gen: int = 15
     ea_eval_samples: int = 30
     ea_fitness_version: str = 'gsm8k_cot_flex_v2'
+    ea_general_task: str = 'mmlu_high_school_world_history'
 
     batch_size: int | str = 1
 

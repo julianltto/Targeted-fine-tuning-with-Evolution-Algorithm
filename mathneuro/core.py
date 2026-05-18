@@ -56,8 +56,6 @@ def compute_importance(
     magnitude: dict[str, torch.Tensor],
     num_samples: int,
 ) -> dict[str, torch.Tensor]:
-    # Accumulate on CPU in the model's dtype (bf16) — only for Linear layers that hooks observe.
-    # Skips embeddings / non-Linear params to avoid allocating hundreds of MB we never read.
     scores: dict[str, torch.Tensor] = {
         f"{name}.weight": torch.zeros_like(module.weight, device='cpu')
         for name, module in model.named_modules()

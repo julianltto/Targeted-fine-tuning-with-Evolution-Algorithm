@@ -134,6 +134,8 @@ def _build_problem_class():
                 math_acc, general_acc = self.eval_fn(self.model)
             finally:
                 restore_weights(self.model, self.weight_backup)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             if not (_math.isfinite(math_acc) and _math.isfinite(general_acc)):
                 math_acc, general_acc = 0.0, -1e3
@@ -141,6 +143,55 @@ def _build_problem_class():
             out["F"] = [-float(math_acc), -float(general_acc)]
 
     return PerLayerFactorProblem
+
+
+def _active_wandb():
+    """Return the wandb module iff it is importable and has a live run, else None."""
+    try:
+        import wandb
+    except Exception:
+        return None
+    return wandb if wandb.run is not None else None
+
+
+def _build_wandb_callback():
+    from pymoo.core.callback import Callback
+
+    class WandbCallback(Callback):
+        def notify(self, algorithm):
+            wandb = _active_wandb()
+            if wandb is None:
+                return
+            
+            acc = -algorithm.pop.get("F")
+            opt = -algorithm.opt.get("F")
+            wandb.log({
+                "ea/gen": int(algorithm.n_gen),
+                "ea/math_acc_best": float(acc[:, 0].max()),
+                "ea/math_acc_mean": float(acc[:, 0].mean()),
+                "ea/general_best": float(acc[:, 1].max()),
+                "ea/general_mean": float(acc[:, 1].mean()),
+                "ea/pareto_size": int(len(opt)),
+            })
+
+    return WandbCallback
+
+
+def _log_pareto_scatter(result) -> None:
+    wandb = _active_wandb()
+    if wandb is None or result.F is None:
+        return
+    pareto = -result.F  # [P, 2] = (math_acc, general)
+    table = wandb.Table(
+        columns=["math_acc", "general"],
+        data=[[float(m), float(g)] for m, g in pareto],
+    )
+    wandb.log({
+        "ea/pareto_front": wandb.plot.scatter(
+            table, "math_acc", "general", title="EA Pareto front",
+        ),
+        "ea/pareto_size_final": int(pareto.shape[0]),
+    })
 
 
 def run_ea_search(
@@ -156,25 +207,6 @@ def run_ea_search(
     seed: int = 42,
     verbose: bool = True,
 ):
-    """
-    Run NSGA-II to find a Pareto front of per-layer pruning strengths.
-
-    Inputs:
-        model            : the (already-loaded) model. Its weights will be temporarily mutated during search and restored between evaluations.
-        math_important   : output of top_k_mask() on math importance scores.
-        calib_important  : output of top_k_mask() on calibration scores.
-        eval_fn          : callable(model) -> (math_acc, general_acc). Both metrics will be maximized.
-        pop_size         : NSGA-II population size.
-        n_gen            : number of generations.
-        exclude_substring: layer names containing this are never pruned.
-        seed             : RNG seed for the algorithm.
-
-    Returns:
-        (result, layer_names) where:
-            result.X       : Pareto front decision vectors,  shape [P, N]
-            result.F       : Pareto front objective values,  shape [P, 2] (negated, i.e. -math_acc and -general_acc)
-            layer_names    : ordered list mapping gene index -> layer name.
-    """
     from pymoo.algorithms.moo.nsga2 import NSGA2
     from pymoo.operators.crossover.sbx import SBX
     from pymoo.operators.mutation.pm import PM
@@ -212,8 +244,10 @@ def run_ea_search(
         ("n_gen", n_gen),
         seed=seed,
         verbose=verbose,
+        callback=_build_wandb_callback()(),
     )
 
+    _log_pareto_scatter(result)
     return result, layer_names
 
 

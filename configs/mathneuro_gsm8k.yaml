@@ -2,9 +2,9 @@ model: meta-llama/Llama-3.2-1B-Instruct
 save_path: ./results
 train_dataset: data/gsm8k.csv
 eval_datasets:
+  - mgsm_direct_en
+  - mathqa
   - mmlu
-  - asdiv
-  - mgsm_en
 calibration_datasets:
   - data/race.csv
 calibration_dataset_names:
@@ -22,10 +22,11 @@ scalar: 0
 
 with_ea: True
 ea_mode: scale        
-ea_max_scale: 0.15
+ea_max_scale: 0.7
 ea_pop_size: 24
 ea_n_gen: 15
 ea_eval_samples: 32
 ea_fitness_version: 'gsm8k_cot_flex_v2'
+ea_general_task: mmlu_high_school_world_history
 
 batch_size: 8

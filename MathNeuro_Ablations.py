@@ -19,7 +19,6 @@ from mathneuro.core import (
 )
 from run import (
     append_text,
-    evaluate_sgsm_few_shot,
     load_calibration_datasets,
     load_model,
     load_train_dataset,
@@ -142,21 +141,6 @@ def run_pre_train_eval_ablation(
     results_root: str,
     output_file: str,
 ) -> None:
-    if 'sgsm' in args.train_dataset:
-        assert val is not None, "SGSM training set must produce a validation split."
-        acc = evaluate_sgsm_few_shot(model, tokenizer, train, val, args.eval_dataset_subset)
-        n = min(args.eval_dataset_subset, len(val))
-        append_text(
-            output_file,
-            f"Average eval accuracy on {n} questions before training with greedy decoding "
-            f"(few-shot): {acc}",
-        )
-        results = run_lm_eval(
-            model, tokenizer, args.eval_datasets,
-            args.eval_dataset_subset, args.random_state, batch_size=_LM_EVAL_BATCH_SIZE,
-        )
-        save_json(f"{results_root}pre_results.json", results)
-
     if args.train_lm_eval_task is not None:
         train_results = run_lm_eval(
             model, tokenizer, args.train_lm_eval_task,
@@ -186,27 +170,6 @@ def run_post_prune_eval_ablation(
     num_samples: int,
 ) -> None:
     method_root = f"{results_root}{method}/"
-
-    if 'sgsm' in args.train_dataset:
-        assert val is not None
-        acc = evaluate_sgsm_few_shot(model, tokenizer, train, val, args.eval_dataset_subset)
-        n = min(args.eval_dataset_subset, len(val))
-        append_text(
-            output_file,
-            f"Average eval accuracy on {n} questions for pruning top {good_percent}% good "
-            f"parameters based on not being activated by {dataset_name} based on {num_samples} "
-            f"training samples and greedy decoding (few-shot) [method={method}]: {acc}",
-        )
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        results = run_lm_eval(
-            model, tokenizer, args.eval_datasets,
-            args.eval_dataset_subset, args.random_state, batch_size=_LM_EVAL_BATCH_SIZE,
-        )
-        save_json(
-            f"{method_root}{dataset_name}_calculate{good_percent}_run{repeat}.json",
-            results,
-        )
 
     if args.train_lm_eval_task is not None:
         train_results = run_lm_eval(
