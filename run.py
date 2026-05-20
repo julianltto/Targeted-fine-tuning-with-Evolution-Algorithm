@@ -1,8 +1,10 @@
 from __future__ import annotations
+import os
+os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
 
 import gc
 import json
-import os
+
 import pickle
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -300,6 +302,7 @@ def search_pareto_front(
     eval_batch_size: int = 16,
     mode: str = 'prune',
     max_scale: float = 0.1,
+    max_prune: float = 0.1,
     math_task: str = 'gsm8k_cot',
     general_task: str = 'mmlu_high_school_world_history',
 ) -> tuple[
@@ -340,7 +343,7 @@ def search_pareto_front(
         model, math_mask, calib_mask,
         make_eval_fn(tokenizer, math_task, general_task, n=eval_samples, batch_size=eval_batch_size),
         pop_size=pop_size, n_gen=n_gen, seed=seed,
-        mode=mode, max_scale=max_scale,
+        mode=mode, max_scale=max_scale, max_prune=max_prune,
     )
     if result.F is None or result.X is None:
         raise RuntimeError("EA search returned no Pareto front.")
@@ -414,6 +417,7 @@ def lm_eval_score(
     if results is None:
         return 0.0
     res = results['results']
+    task_result = res.get(task)
     if task_result is None and res:
         task_result = next(iter(res.values()))
     return _extract_scalar_metric(task_result or {})
@@ -590,6 +594,7 @@ def main():
                         'eval_samples': args.ea_eval_samples,
                         'mode': args.ea_mode,
                         'max_scale': args.ea_max_scale,
+                        'max_prune': args.ea_max_prune,
                         'fitness_version': args.ea_fitness_version,
                     }
                     # Reuse a prior EA run only if its config matches exactly;
@@ -623,6 +628,7 @@ def main():
                                 eval_batch_size=int(args.batch_size) if isinstance(args.batch_size, int) or (isinstance(args.batch_size, str) and args.batch_size.isdigit()) else 16,
                                 mode=args.ea_mode,
                                 max_scale=args.ea_max_scale,
+                                max_prune=args.ea_max_prune,
                                 math_task=args.train_lm_eval_task or 'gsm8k_cot',
                                 general_task=getattr(args, 'ea_general_task', 'mmlu_high_school_world_history'),
                             )
@@ -655,6 +661,7 @@ def main():
                             math_mask, calib_mask, strengths,
                             mode=args.ea_mode,
                             max_scale=args.ea_max_scale,
+                            max_prune=args.ea_max_prune,
                         )
                         apply_mask_to_model(model, intervention_mask)
 

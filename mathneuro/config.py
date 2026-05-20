@@ -27,7 +27,8 @@ class MathNeuroConfig:
 
     with_ea: bool = False
     ea_mode: str = 'scale'       
-    ea_max_scale: float = 0.1      
+    ea_max_scale: float = 0.1
+    ea_max_prune: float = 0.1
     ea_pop_size: int = 20
     ea_n_gen: int = 15
     ea_eval_samples: int = 30
@@ -80,6 +81,8 @@ CONFIG: MathNeuroConfig = MathNeuroConfig(
     eval_dataset_subset=8,
     train_lm_eval_task="gsm8k_cot",
     with_ea=True,
+    ea_max_scale=0.1,
+    ea_max_prune=0.1,
     ea_fitness_version='gsm8k_cot_flex_v2',
 )
 
