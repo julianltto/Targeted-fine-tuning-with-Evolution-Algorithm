@@ -302,7 +302,9 @@ def search_pareto_front(
     max_scale: float = 0.1,
     math_task: str = 'gsm8k_cot',
     general_task: str = 'mmlu_high_school_world_history',
+    math_holdout_task: str | None = None,
     group_by: str = 'none',
+    n_obj: int = 2,
 ) -> tuple[
     list[dict[str, float]],
     np.ndarray,
@@ -337,11 +339,17 @@ def search_pareto_front(
         remove_hooks(handles)
     gc.collect()
 
+    seed_ref = [0]
+    ea_general = None if n_obj == 1 else general_task
     result, layer_names, layer_to_group = run_ea_search(
         model, math_mask, calib_mask,
-        make_eval_fn(tokenizer, math_task, general_task, n=eval_samples, batch_size=eval_batch_size),
+        make_eval_fn(tokenizer, math_task, ea_general,
+                     math_holdout_task=math_holdout_task,
+                     n=eval_samples, batch_size=eval_batch_size,
+                     rotate_seed=True, seed_ref=seed_ref),
         pop_size=pop_size, n_gen=n_gen, seed=seed,
         mode=mode, max_scale=max_scale, group_by=group_by,
+        seed_ref=seed_ref, n_obj=n_obj,
     )
     if result.F is None or result.X is None:
         raise RuntimeError("EA search returned no Pareto front.")
@@ -417,6 +425,7 @@ def lm_eval_score(
     if results is None:
         return 0.0
     res = results['results']
+    task_result = res.get(task)
     if task_result is None and res:
         task_result = next(iter(res.values()))
     return _extract_scalar_metric(task_result or {})
@@ -468,17 +477,26 @@ def dump_sample_generations(
 def make_eval_fn(
     tokenizer,
     math_task: str,
-    general_task: str,
+    general_task: str | None,
+    math_holdout_task: str | None = None,
     n: int = 32,
     batch_size: int = 8,
+    rotate_seed: bool = True,
+    seed_ref: list | None = None,
 ):
+    if seed_ref is None:
+        seed_ref = [42]
+
     def eval_fn(model):
-        math_score = lm_eval_score(
-            model, tokenizer, math_task, limit=n, batch_size=min(batch_size, 8),
-        )
-        general_score = lm_eval_score(
-            model, tokenizer, general_task, limit=n, batch_size=min(batch_size, 8),
-        )
+        seed = seed_ref[0] if rotate_seed else 42
+        bs = min(batch_size, 8)
+        math_score = lm_eval_score(model, tokenizer, math_task, limit=n, batch_size=bs, seed=seed)
+        if not general_task:
+            return (math_score,)
+        general_score = lm_eval_score(model, tokenizer, general_task, limit=n, batch_size=bs, seed=seed)
+        if math_holdout_task:
+            holdout_score = lm_eval_score(model, tokenizer, math_holdout_task, limit=n, batch_size=bs, seed=seed)
+            return math_score, holdout_score, general_score
         return math_score, general_score
     return eval_fn
 
@@ -534,6 +552,7 @@ def run_post_prune_eval(
             sample_dump_path=f"{results_root}{tag}_eval_samples.json",
         )
         save_json(f"{results_root}{tag}.json", eval_results)
+
 
 
 # Entry point
@@ -595,6 +614,12 @@ def main():
                         'max_scale': args.ea_max_scale,
                         'group_by': args.ea_group_by,
                         'fitness_version': args.ea_fitness_version,
+                        'math_task': args.train_lm_eval_task or 'gsm8k_cot',
+                        'general_task': getattr(args, 'ea_general_task', None),
+                        'holdout_task': getattr(args, 'ea_holdout_task', None),
+                        'n_obj': getattr(args, 'ea_n_obj', 2),
+                        'train_dataset': args.train_dataset,
+                        'calibration_datasets': args.calibration_datasets,
                     }
                     # Reuse a prior EA run only if its config matches exactly;
                     # the search is expensive so checkpoints save full reruns.
@@ -629,7 +654,9 @@ def main():
                                 max_scale=args.ea_max_scale,
                                 math_task=args.train_lm_eval_task or 'gsm8k_cot',
                                 general_task=getattr(args, 'ea_general_task', 'mmlu_high_school_world_history'),
+                                math_holdout_task=getattr(args, 'ea_holdout_task', None),
                                 group_by=args.ea_group_by,
+                                n_obj=getattr(args, 'ea_n_obj', 2),
                             )
                         finally:
                             finish_wandb(wandb_run)
@@ -645,14 +672,23 @@ def main():
                     # evaluated, then rolled back via this snapshot.
                     weight_snapshot = backup_weights(model)
                     for point_idx, strengths in enumerate(strengths_list):
-                        math_score, general_score = scores[point_idx]
+                        point_scores = scores[point_idx]
+                        if len(point_scores) == 3:
+                            math_score, holdout_score, general_score = point_scores
+                        elif len(point_scores) == 2:
+                            math_score, general_score = point_scores
+                            holdout_score = None
+                        else:
+                            math_score = point_scores[0]
+                            holdout_score = general_score = None
                         stats = compute_prune_stats(math_mask, calib_mask, strengths)
 
+                        holdout_str = f" holdout={holdout_score:.4f}" if holdout_score is not None else ""
                         append_text(
                             output_file,
                             f"[EA point {point_idx}] mode={args.ea_mode} "
                             f"keep_ratio={keep_ratio} calib={dataset_name} "
-                            f"math_acc={math_score:.4f} general_score={general_score:.4f} "
+                            f"math_acc={math_score:.4f}{holdout_str} general_score={general_score:.4f} "
                             f"intervention_strength={stats['effective_intervention_strength']:.4f}",
                         )
 

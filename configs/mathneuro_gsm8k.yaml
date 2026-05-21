@@ -3,6 +3,7 @@ save_path: ./results
 train_dataset: data/gsm8k.csv
 eval_datasets:
   - mmlu
+  - hendrycks_math_algebra
 calibration_datasets:
   - data/race.csv
 calibration_dataset_names:
@@ -11,9 +12,9 @@ calibration_dataset_names:
 text_file: results.txt
 pre_train_eval: False
 num_repeats: 1
-proportion: [0.05, 0.1, 0.2]
+proportion: [0.05]
 num_samples: 128
-eval_dataset_subset: 50
+eval_dataset_subset: 128
 train_lm_eval_task: gsm8k_cot
 random_state: 42
 scalar: 0
@@ -26,6 +27,7 @@ ea_n_gen: 25
 ea_eval_samples: 64
 ea_fitness_version: 'gsm8k_cot_flex_v2'
 ea_general_task: mmlu_high_school_world_history
+ea_n_obj: 1
 ea_group_by: proj_type        # none | proj_type | block
 
-batch_size: 16
+batch_size: 8

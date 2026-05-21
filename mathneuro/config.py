@@ -33,6 +33,8 @@ class MathNeuroConfig:
     ea_eval_samples: int = 30
     ea_fitness_version: str = 'gsm8k_cot_flex_v2'
     ea_general_task: str = 'mmlu_high_school_world_history'
+    ea_holdout_task: str | None = None
+    ea_n_obj: int = 2
     ea_group_by: str = 'none'       # 'none' | 'proj_type' | 'block'
 
     batch_size: int | str = 1
