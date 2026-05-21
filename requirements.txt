@@ -5,5 +5,5 @@ numpy==2.1.2
 PyYAML==6.0.2
 lm_eval==0.4.2
 pymoo==0.6.1.6
-datasets==4.8.5
+datasets==2.19.1
 -e .

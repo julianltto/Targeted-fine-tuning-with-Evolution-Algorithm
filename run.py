@@ -17,6 +17,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from lm_eval import simple_evaluate
 from lm_eval.tasks import TaskManager
+from lm_eval.models.huggingface import HFLM   # ← add this
 
 from mathneuro.config import load_config
 from mathneuro import *
@@ -27,6 +28,19 @@ class CalibrationDataset:
     name: str
     data: pd.DataFrame
 
+
+def _wrap_lm(model: nn.Module, tokenizer, batch_size: int | str = 1,
+             max_length: int | None = None) -> HFLM:
+    """Wrap an already-loaded HF model + tokenizer as an lm-eval LM instance.
+
+    Passing this object to simple_evaluate(model=...) avoids the SHA-lookup
+    warning that fires when `pretrained` is given a model object instead of
+    a string repo id.
+    """
+    kwargs = dict(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
+    if max_length is not None:
+        kwargs['max_length'] = max_length
+    return HFLM(**kwargs)
 
 # Data loading
 
@@ -81,8 +95,7 @@ def run_lm_eval(
     task_manager = TaskManager()
     task_list: list[Any] = [tasks] if isinstance(tasks, str) else list(tasks)
     results = simple_evaluate(
-        model='hf',
-        model_args={'pretrained': model, 'dtype': 'bfloat16', 'tokenizer': tokenizer, 'max_length': 2048},
+        model=_wrap_lm(model, tokenizer, batch_size=batch_size, max_length=2048),
         tasks=task_list,
         task_manager=task_manager,
         log_samples=sample_dump_path is not None,
@@ -258,21 +271,84 @@ def compute_prune_stats(
 
 # wandb monitoring
 
-def init_wandb(project: str, run_name: str, config: dict[str, Any]):
+# Strictness controls (env-driven):
+#   WANDB_DISABLED=1         -> skip wandb entirely, log_safe is a no-op
+#   WANDB_REQUIRE_ONLINE=1   -> raise if online init fails (do NOT silently
+#                               fall back to offline) -- recommended for long runs
+#   WANDB_MODE=offline       -> standard wandb env knob, respected by wandb.init
+def init_wandb(
+    project: str,
+    run_name: str,
+    config: dict[str, Any],
+    *,
+    group: str | None = None,
+    job_type: str | None = None,
+    tags: list[str] | None = None,
+    resume_id: str | None = None,
+):
+    """Initialize a wandb run, loudly.
+
+    - If WANDB_DISABLED=1, returns None silently (true opt-out).
+    - Otherwise attempts online init; on failure either raises (if
+      WANDB_REQUIRE_ONLINE=1) or falls back to offline with a loud warning
+      so you know you'll need `wandb sync` later.
+    - On success, prints the run URL so it's visible in nohup logs.
+    """
+    if os.environ.get("WANDB_DISABLED") == "1":
+        print("[wandb] WANDB_DISABLED=1 set; skipping wandb init")
+        return None
+
     try:
         import wandb
     except Exception as e:
-        print(f"[wandb] not available ({e}); skipping monitoring")
+        msg = f"[wandb] import failed: {e}"
+        if os.environ.get("WANDB_REQUIRE_ONLINE") == "1":
+            raise RuntimeError(msg) from e
+        print(msg + "; continuing without tracking")
         return None
-    for mode in ("online", "offline"):
-        try:
-            return wandb.init(
-                project=project, name=run_name, config=config,
-                mode=mode, reinit=True,
-            )
-        except Exception as e:
-            print(f"[wandb] init mode={mode} failed: {e}")
-    return None
+
+    requested_mode = os.environ.get("WANDB_MODE", "online")
+    init_kwargs = dict(
+        project=project,
+        name=run_name,
+        config=config,
+        reinit=True,
+        group=group,
+        job_type=job_type,
+        tags=tags,
+    )
+    if resume_id is not None:
+        init_kwargs["id"] = resume_id
+        init_kwargs["resume"] = "allow"
+
+    # Try the requested mode first.
+    try:
+        run = wandb.init(mode=requested_mode, **init_kwargs)
+    except Exception as e:
+        print(f"[wandb] init mode={requested_mode!r} failed: {e}", flush=True)
+        if requested_mode == "online" and os.environ.get("WANDB_REQUIRE_ONLINE") != "1":
+            print("[wandb] falling back to mode='offline' -- "
+                  "run `wandb sync wandb/offline-run-*` after the job to upload.",
+                  flush=True)
+            try:
+                run = wandb.init(mode="offline", **init_kwargs)
+            except Exception as e2:
+                print(f"[wandb] offline fallback also failed: {e2}", flush=True)
+                return None
+        else:
+            if os.environ.get("WANDB_REQUIRE_ONLINE") == "1":
+                raise
+            return None
+
+    # Print the run URL so it shows up in nohup logs.
+    try:
+        url = getattr(run, "url", None) or getattr(run, "get_url", lambda: None)()
+        rid = getattr(run, "id", "?")
+        mode_actual = getattr(run.settings, "_mode", "?") if hasattr(run, "settings") else "?"
+        print(f"[wandb] init ok id={rid} mode={mode_actual} url={url}", flush=True)
+    except Exception:
+        pass
+    return run
 
 
 def finish_wandb(run) -> None:
@@ -282,7 +358,61 @@ def finish_wandb(run) -> None:
         import wandb
         wandb.finish()
     except Exception as e:
-        print(f"[wandb] finish failed: {e}")
+        print(f"[wandb] finish failed: {e}", flush=True)
+
+
+def wandb_log_safe(metrics: dict[str, Any], step: int | None = None) -> None:
+    """Log to the currently-active wandb run if one exists; otherwise no-op.
+
+    Use this everywhere you want to log a metric. It will not crash if wandb
+    is disabled, not installed, or no run is active.
+    """
+    try:
+        import wandb
+    except Exception:
+        return
+    if wandb.run is None:
+        return
+    try:
+        if step is not None:
+            wandb.log(metrics, step=step)
+        else:
+            wandb.log(metrics)
+    except Exception as e:
+        print(f"[wandb] log failed: {e}", flush=True)
+
+
+def _wandb_summary_update(summary: dict[str, Any]) -> None:
+    """Write key=value pairs to wandb.run.summary if a run is active."""
+    try:
+        import wandb
+    except Exception:
+        return
+    if wandb.run is None:
+        return
+    try:
+        for k, v in summary.items():
+            wandb.run.summary[k] = v
+    except Exception as e:
+        print(f"[wandb] summary update failed: {e}", flush=True)
+
+
+def _flatten_lm_eval_results(prefix: str, results: dict[str, Any]) -> dict[str, float]:
+    """Turn lm-eval's nested per-task dict into a flat {prefix/task/metric: value} dict."""
+    flat: dict[str, float] = {}
+    if not isinstance(results, dict):
+        return flat
+    for task, task_result in results.items():
+        if not isinstance(task_result, dict):
+            continue
+        for k, v in task_result.items():
+            if k == "alias" or "stderr" in k:
+                continue
+            try:
+                flat[f"{prefix}/{task}/{k}"] = float(v)
+            except (TypeError, ValueError):
+                continue
+    return flat
 
 
 # Pareto-front EA search
@@ -404,8 +534,7 @@ def lm_eval_score(
     seed: int = 42,
 ) -> float:
     results = simple_evaluate(
-        model='hf',
-        model_args={'pretrained': model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
+        model=_wrap_lm(model, tokenizer, batch_size=batch_size),
         tasks=[task],
         task_manager=_get_task_manager(),
         log_samples=False,
@@ -433,8 +562,7 @@ def dump_sample_generations(
     seed: int = 42,
 ) -> list[dict]:
     results = simple_evaluate(
-        model='hf',
-        model_args={'pretrained': model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
+        model=_wrap_lm(model, tokenizer, batch_size=batch_size),
         tasks=[task],
         task_manager=_get_task_manager(),
         log_samples=True,
@@ -499,6 +627,7 @@ def run_pre_train_eval(
             sample_dump_path=f"{results_root}pre_results_train_task_samples.json",
         )
         save_json(f"{results_root}pre_results_train_task.json", train_results)
+        wandb_log_safe(_flatten_lm_eval_results("pre/train_task", train_results))
 
         eval_results = run_lm_eval(
             model, tokenizer, args.eval_datasets,
@@ -507,6 +636,7 @@ def run_pre_train_eval(
             sample_dump_path=f"{results_root}pre_results_eval_samples.json",
         )
         save_json(f"{results_root}pre_results.json", eval_results)
+        wandb_log_safe(_flatten_lm_eval_results("pre/eval", eval_results))
 
 
 def run_post_prune_eval(
@@ -517,6 +647,7 @@ def run_post_prune_eval(
     dataset_name: str,
     good_percent: float,
     repeat: int,
+    wandb_prefix: str | None = None,
 ) -> None:
     if args.train_lm_eval_task is not None:
         tag = f"{dataset_name}_calculate{good_percent}_run{repeat}"
@@ -527,6 +658,8 @@ def run_post_prune_eval(
             sample_dump_path=f"{results_root}{tag}_train_task_samples.json",
         )
         save_json(f"{results_root}{tag}_train_task.json", train_results)
+        if wandb_prefix:
+            wandb_log_safe(_flatten_lm_eval_results(f"{wandb_prefix}/train_task", train_results))
 
         eval_results = run_lm_eval(
             model, tokenizer, args.eval_datasets,
@@ -535,6 +668,8 @@ def run_post_prune_eval(
             sample_dump_path=f"{results_root}{tag}_eval_samples.json",
         )
         save_json(f"{results_root}{tag}.json", eval_results)
+        if wandb_prefix:
+            wandb_log_safe(_flatten_lm_eval_results(f"{wandb_prefix}/eval", eval_results))
 
 
 # Entry point
@@ -555,12 +690,23 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
+    wandb_project = f"mathneuro-{args.model.split('/')[-1]}"
+
     if args.pre_train_eval:
-        model = load_model(args.model)
-        run_pre_train_eval(args, model, tokenizer, results_root)
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        pre_run = init_wandb(
+            project=wandb_project,
+            run_name="pre_train_eval",
+            config=args.as_dict() if hasattr(args, "as_dict") else {"phase": "pre"},
+            job_type="pre_eval",
+        )
+        try:
+            model = load_model(args.model)
+            run_pre_train_eval(args, model, tokenizer, results_root)
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        finally:
+            finish_wandb(pre_run)
 
     if args.proportion is None:
         keep_ratios = [0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.15]
@@ -582,37 +728,66 @@ def main():
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-                if args.with_ea:
-                    ckpt_path = ea_checkpoint_path(results_root, dataset_name, keep_ratio, repeat)
-                    ckpt_config = {
-                        'model': args.model,
-                        'keep_ratio': keep_ratio,
-                        'num_samples': num_samples,
-                        'seed': args.random_state,
-                        'pop_size': args.ea_pop_size,
-                        'n_gen': args.ea_n_gen,
-                        'eval_samples': args.ea_eval_samples,
-                        'mode': args.ea_mode,
-                        'max_scale': args.ea_max_scale,
-                        'max_prune': args.ea_max_prune,
-                        'fitness_version': args.ea_fitness_version,
-                    }
-                    # Reuse a prior EA run only if its config matches exactly;
-                    # the search is expensive so checkpoints save full reruns.
-                    cached = try_load_ea_checkpoint(ckpt_path, ckpt_config)
-                    if cached is not None:
-                        print(f"[EA ckpt] loaded {ckpt_path}")
-                        strengths_list = cached['strengths_list']
-                        scores = cached['scores']
-                        math_mask = cached['math_mask']
-                        calib_mask = cached['calib_mask']
-                    else:
-                        wandb_run = init_wandb(
-                            project=f"mathneuro-{args.model.split('/')[-1]}",
-                            run_name=f"{dataset_name}_keep{keep_ratio}_run{repeat}",
-                            config=ckpt_config,
-                        )
-                        try:
+                # Build the per-iteration wandb config up front so cached and
+                # uncached paths get the same metadata.
+                iter_run_name = f"{dataset_name}_keep{keep_ratio}_run{repeat}"
+                iter_config = {
+                    'model': args.model,
+                    'calib_dataset': dataset_name,
+                    'keep_ratio': keep_ratio,
+                    'repeat': repeat,
+                    'num_samples': num_samples,
+                    'seed': args.random_state,
+                    'with_ea': bool(args.with_ea),
+                    'ea_mode': args.ea_mode,
+                    'ea_pop_size': args.ea_pop_size,
+                    'ea_n_gen': args.ea_n_gen,
+                    'ea_eval_samples': args.ea_eval_samples,
+                    'ea_max_scale': args.ea_max_scale,
+                    'ea_max_prune': args.ea_max_prune,
+                    'ea_fitness_version': args.ea_fitness_version,
+                    'batch_size': args.batch_size,
+                }
+
+                # One wandb run per outer iteration, wrapping EVERYTHING --
+                # cache check, search, all per-Pareto-point evaluations.
+                wandb_run = init_wandb(
+                    project=wandb_project,
+                    run_name=iter_run_name,
+                    config=iter_config,
+                    group=dataset_name,
+                    job_type="ea" if args.with_ea else "fixed_prune",
+                    tags=[f"keep={keep_ratio}", f"mode={args.ea_mode}"],
+                )
+
+                try:
+                    if args.with_ea:
+                        ckpt_path = ea_checkpoint_path(results_root, dataset_name, keep_ratio, repeat)
+                        ckpt_config = {
+                            'model': args.model,
+                            'keep_ratio': keep_ratio,
+                            'num_samples': num_samples,
+                            'seed': args.random_state,
+                            'pop_size': args.ea_pop_size,
+                            'n_gen': args.ea_n_gen,
+                            'eval_samples': args.ea_eval_samples,
+                            'mode': args.ea_mode,
+                            'max_scale': args.ea_max_scale,
+                            'max_prune': args.ea_max_prune,
+                            'fitness_version': args.ea_fitness_version,
+                        }
+                        # Reuse a prior EA run only if its config matches exactly;
+                        # the search is expensive so checkpoints save full reruns.
+                        cached = try_load_ea_checkpoint(ckpt_path, ckpt_config)
+                        if cached is not None:
+                            print(f"[EA ckpt] loaded {ckpt_path}")
+                            strengths_list = cached['strengths_list']
+                            scores = cached['scores']
+                            math_mask = cached['math_mask']
+                            calib_mask = cached['calib_mask']
+                            wandb_log_safe({"ea/from_cache": 1, "ea/pareto_size_final": len(strengths_list)})
+                        else:
+                            wandb_log_safe({"ea/from_cache": 0})
                             strengths_list, scores, math_mask, calib_mask = search_pareto_front(
                                 model=model,
                                 tokenizer=tokenizer,
@@ -632,67 +807,82 @@ def main():
                                 math_task=args.train_lm_eval_task or 'gsm8k_cot',
                                 general_task=getattr(args, 'ea_general_task', 'mmlu_high_school_world_history'),
                             )
-                        finally:
-                            finish_wandb(wandb_run)
-                        save_ea_checkpoint(ckpt_path, {
-                            'config': ckpt_config,
-                            'strengths_list': strengths_list,
-                            'scores': scores,
-                            'math_mask': math_mask,
-                            'calib_mask': calib_mask,
+                            save_ea_checkpoint(ckpt_path, {
+                                'config': ckpt_config,
+                                'strengths_list': strengths_list,
+                                'scores': scores,
+                                'math_mask': math_mask,
+                                'calib_mask': calib_mask,
+                            })
+                            print(f"[EA ckpt] saved {ckpt_path}")
+
+                        # Each Pareto point is applied to the same base weights,
+                        # evaluated, then rolled back via this snapshot.
+                        weight_snapshot = backup_weights(model)
+                        for point_idx, strengths in enumerate(strengths_list):
+                            math_score, general_score = scores[point_idx]
+                            stats = compute_prune_stats(math_mask, calib_mask, strengths)
+
+                            append_text(
+                                output_file,
+                                f"[EA point {point_idx}] mode={args.ea_mode} "
+                                f"keep_ratio={keep_ratio} calib={dataset_name} "
+                                f"math_acc={math_score:.4f} general_score={general_score:.4f} "
+                                f"intervention_strength={stats['effective_intervention_strength']:.4f}",
+                            )
+                            wandb_log_safe({
+                                "pareto/point_idx": point_idx,
+                                "pareto/math_acc_search": float(math_score),
+                                "pareto/general_search": float(general_score),
+                                "pareto/intervention_strength": float(stats['effective_intervention_strength']),
+                            })
+
+                            intervention_mask = build_intervention_mask_per_layer(
+                                math_mask, calib_mask, strengths,
+                                mode=args.ea_mode,
+                                max_scale=args.ea_max_scale,
+                                max_prune=args.ea_max_prune,
+                            )
+                            apply_mask_to_model(model, intervention_mask)
+
+                            run_post_prune_eval(
+                                args, model, tokenizer, results_root,
+                                dataset_name=f"{dataset_name}_ea{point_idx}",
+                                good_percent=keep_ratio,
+                                repeat=repeat,
+                                wandb_prefix=f"post/ea_point_{point_idx}",
+                            )
+
+                            restore_weights(model, weight_snapshot)
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+
+                        _wandb_summary_update({
+                            "pareto/n_points": len(strengths_list),
+                            "pareto/best_math_acc_search": float(max(s[0] for s in scores)) if len(scores) else 0.0,
+                            "pareto/best_general_search": float(max(s[1] for s in scores)) if len(scores) else 0.0,
                         })
-                        print(f"[EA ckpt] saved {ckpt_path}")
-                    # Each Pareto point is applied to the same base weights,
-                    # evaluated, then rolled back via this snapshot.
-                    weight_snapshot = backup_weights(model)
-                    for point_idx, strengths in enumerate(strengths_list):
-                        math_score, general_score = scores[point_idx]
-                        stats = compute_prune_stats(math_mask, calib_mask, strengths)
-
-                        append_text(
-                            output_file,
-                            f"[EA point {point_idx}] mode={args.ea_mode} "
-                            f"keep_ratio={keep_ratio} calib={dataset_name} "
-                            f"math_acc={math_score:.4f} general_score={general_score:.4f} "
-                            f"intervention_strength={stats['effective_intervention_strength']:.4f}",
+                    else:
+                        prune_math_specific(
+                            model=model,
+                            tokenizer=tokenizer,
+                            train_df=sampled_train,
+                            calib_df=sampled_calib,
+                            calib_name=dataset_name,
+                            keep_ratio=keep_ratio,
+                            num_samples=num_samples,
+                            factor=args.scalar,
                         )
-
-                        intervention_mask = build_intervention_mask_per_layer(
-                            math_mask, calib_mask, strengths,
-                            mode=args.ea_mode,
-                            max_scale=args.ea_max_scale,
-                            max_prune=args.ea_max_prune,
-                        )
-                        apply_mask_to_model(model, intervention_mask)
 
                         run_post_prune_eval(
                             args, model, tokenizer, results_root,
-                            dataset_name=f"{dataset_name}_ea{point_idx}",
-                            good_percent=keep_ratio,
+                            dataset_name=dataset_name, good_percent=keep_ratio,
                             repeat=repeat,
+                            wandb_prefix="post/fixed",
                         )
-
-                        restore_weights(model, weight_snapshot)
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                else:
-                    prune_math_specific(
-                        model=model,
-                        tokenizer=tokenizer,
-                        train_df=sampled_train,
-                        calib_df=sampled_calib,
-                        calib_name=dataset_name,
-                        keep_ratio=keep_ratio,
-                        num_samples=num_samples,
-                        factor=args.scalar,
-                    )
-
-                    run_post_prune_eval(
-                        args, model, tokenizer, results_root,
-                        dataset_name=dataset_name, good_percent=keep_ratio,
-                        repeat=repeat,
-                    )
+                finally:
+                    finish_wandb(wandb_run)
 
                 del model
                 if torch.cuda.is_available():
