@@ -302,6 +302,7 @@ def search_pareto_front(
     max_scale: float = 0.1,
     math_task: str = 'gsm8k_cot',
     general_task: str = 'mmlu_high_school_world_history',
+    group_by: str = 'none',
 ) -> tuple[
     list[dict[str, float]],
     np.ndarray,
@@ -336,11 +337,11 @@ def search_pareto_front(
         remove_hooks(handles)
     gc.collect()
 
-    result, layer_names = run_ea_search(
+    result, layer_names, layer_to_group = run_ea_search(
         model, math_mask, calib_mask,
         make_eval_fn(tokenizer, math_task, general_task, n=eval_samples, batch_size=eval_batch_size),
         pop_size=pop_size, n_gen=n_gen, seed=seed,
-        mode=mode, max_scale=max_scale,
+        mode=mode, max_scale=max_scale, group_by=group_by,
     )
     if result.F is None or result.X is None:
         raise RuntimeError("EA search returned no Pareto front.")
@@ -348,8 +349,10 @@ def search_pareto_front(
     # pymoo minimizes, so objectives were negated during search; flip back.
     pareto_F = -result.F
     pareto_X = result.X
+    # pareto_X has one column per EA group; expand it back into a per-layer
+    # strength dict so every grouped layer gets its group's optimized value.
     strengths_list = [
-        {layer_names[j]: float(pareto_X[i, j]) for j in range(len(layer_names))}
+        {name: float(pareto_X[i, layer_to_group[name]]) for name in layer_names}
         for i in range(pareto_X.shape[0])
     ]
     return strengths_list, pareto_F, math_mask, calib_mask
@@ -590,6 +593,7 @@ def main():
                         'eval_samples': args.ea_eval_samples,
                         'mode': args.ea_mode,
                         'max_scale': args.ea_max_scale,
+                        'group_by': args.ea_group_by,
                         'fitness_version': args.ea_fitness_version,
                     }
                     # Reuse a prior EA run only if its config matches exactly;
@@ -625,6 +629,7 @@ def main():
                                 max_scale=args.ea_max_scale,
                                 math_task=args.train_lm_eval_task or 'gsm8k_cot',
                                 general_task=getattr(args, 'ea_general_task', 'mmlu_high_school_world_history'),
+                                group_by=args.ea_group_by,
                             )
                         finally:
                             finish_wandb(wandb_run)

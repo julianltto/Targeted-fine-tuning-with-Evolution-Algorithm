@@ -20,6 +20,62 @@ def list_prunable_layer_names(
     )
 
 
+def _group_key(layer_name: str, group_by: str) -> str:
+    """
+    Map a layer's parameter name to the key of the EA group it belongs to.
+
+    'none'      -> the layer name itself (one variable per layer, ~112 vars).
+    'proj_type' -> the projection name, e.g. 'q_proj', shared across all blocks.
+    'block'     -> 'block.<i>' for every layer inside transformer block i.
+
+    Names that don't match the expected pattern (e.g. 'lm_head.weight') fall
+    back to their own name and simply become singleton groups.
+    """
+    if group_by == 'none':
+        return layer_name
+
+    parts = layer_name.split('.')
+    if group_by == 'proj_type':
+        for part in parts:
+            if part.endswith('_proj'):
+                return part
+        return layer_name
+    if group_by == 'block':
+        for i, part in enumerate(parts):
+            if part == 'layers' and i + 1 < len(parts):
+                return f'block.{parts[i + 1]}'
+        return layer_name
+
+    raise ValueError(
+        f"group_by must be 'none', 'proj_type' or 'block', got {group_by!r}"
+    )
+
+
+def build_layer_groups(
+    layer_names: list[str],
+    group_by: str = 'none',
+) -> tuple[list[str], dict[str, int]]:
+    """
+    Partition prunable layers into EA optimization groups.
+
+    Returns ``(group_names, layer_to_group)``: ``group_names`` is the ordered
+    list of group keys whose length is the EA ``n_var``; ``layer_to_group``
+    maps every layer name to the index of its group. Every layer in a group
+    shares one optimized strength, which is what lets a small evaluation
+    budget cover the whole model instead of degenerating into random search.
+    """
+    group_names: list[str] = []
+    index_of: dict[str, int] = {}
+    layer_to_group: dict[str, int] = {}
+    for name in layer_names:
+        key = _group_key(name, group_by)
+        if key not in index_of:
+            index_of[key] = len(group_names)
+            group_names.append(key)
+        layer_to_group[name] = index_of[key]
+    return group_names, layer_to_group
+
+
 def build_intervention_mask_per_layer(
     math_important: dict[str, torch.Tensor],
     calib_important: dict[str, torch.Tensor],
@@ -84,7 +140,8 @@ def _build_problem_class():
             model: nn.Module,
             math_important: dict[str, torch.Tensor],
             calib_important: dict[str, torch.Tensor],
-            layer_names: list[str],
+            layer_to_group: dict[str, int],
+            n_groups: int,
             weight_backup: dict[str, torch.Tensor],
             eval_fn: Callable[[nn.Module], tuple[float, float]],
             mode: str = 'prune',
@@ -94,16 +151,16 @@ def _build_problem_class():
             if mode not in {'prune', 'scale'}:
                 raise ValueError(f"mode must be 'prune' or 'scale', got {mode!r}")
             super().__init__(
-                n_var=len(layer_names),
+                n_var=n_groups,
                 n_obj=2,
                 n_constr=0,
-                xl=np.zeros(len(layer_names)),
-                xu=np.ones(len(layer_names)),
+                xl=np.zeros(n_groups),
+                xu=np.ones(n_groups),
             )
             self.model = model
             self.math_important = math_important
             self.calib_important = calib_important
-            self.layer_names = layer_names
+            self.layer_to_group = layer_to_group
             self.weight_backup = weight_backup
             self.eval_fn = eval_fn
             self.mode = mode
@@ -111,9 +168,11 @@ def _build_problem_class():
             self.exclude_substring = exclude_substring
 
         def _evaluate(self, x, out, *args, **kwargs):
+            # Every layer reads the strength of the EA group it belongs to,
+            # so layers sharing a group are intervened on with one value.
             strengths = {
-                self.layer_names[i]: float(x[i])
-                for i in range(len(self.layer_names))
+                name: float(x[group_idx])
+                for name, group_idx in self.layer_to_group.items()
             }
             params = dict(self.model.named_parameters())
             with torch.no_grad():
@@ -206,6 +265,7 @@ def run_ea_search(
     exclude_substring: str = 'embed',
     seed: int = 42,
     verbose: bool = True,
+    group_by: str = 'none',
 ):
     from pymoo.algorithms.moo.nsga2 import NSGA2
     from pymoo.operators.crossover.sbx import SBX
@@ -214,6 +274,11 @@ def run_ea_search(
     from pymoo.optimize import minimize
 
     layer_names = list_prunable_layer_names(math_important, exclude_substring)
+    group_names, layer_to_group = build_layer_groups(layer_names, group_by)
+    print(
+        f"[EA] group_by={group_by!r}: {len(layer_names)} prunable layers "
+        f"-> {len(group_names)} search variables"
+    )
 
     weight_backup = backup_weights(model)
 
@@ -222,7 +287,8 @@ def run_ea_search(
         model=model,
         math_important=math_important,
         calib_important=calib_important,
-        layer_names=layer_names,
+        layer_to_group=layer_to_group,
+        n_groups=len(group_names),
         weight_backup=weight_backup,
         eval_fn=eval_fn,
         mode=mode,
@@ -248,13 +314,13 @@ def run_ea_search(
     )
 
     _log_pareto_scatter(result)
-    return result, layer_names
+    return result, layer_names, layer_to_group
 
 
 def format_pareto_front(
     result,
-    layer_names: list[str],
-    top_k_layers: int = 5,
+    group_names: list[str],
+    top_k: int = 5,
 ) -> str:
     lines = []
     X = result.X
@@ -264,13 +330,12 @@ def format_pareto_front(
     for rank, idx in enumerate(order):
         math_acc, gen_acc = F[idx]
         strengths = X[idx]
-        top_layers = np.argsort(-strengths)[:top_k_layers]
-        layers_str = ", ".join(
-            f"{layer_names[i].split('.')[-2]}:{strengths[i]:.2f}"
-            for i in top_layers
+        top = np.argsort(-strengths)[:top_k]
+        groups_str = ", ".join(
+            f"{group_names[i]}:{strengths[i]:.2f}" for i in top
         )
         lines.append(
             f"[{rank:2d}] math={math_acc:.4f}  general={gen_acc:.4f}  "
-            f"top-pruned: {layers_str}"
+            f"top-pruned: {groups_str}"
         )
     return "\n".join(lines)
