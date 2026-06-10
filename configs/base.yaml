@@ -1,0 +1,17 @@
+# evo-math shared config (M0). All entry scripts read this; never hardcode paths.
+model_path: meta-llama/Llama-3.2-1B   # resolved through HF cache below (base, NOT Instruct)
+hf_home: /home/iailab71/wul1/hf_cache
+dtype: bfloat16
+
+# evaluation
+eval_indices: data/eval_indices.json        # 500-question dev set (fixed forever)
+heldout_indices: data/heldout_indices.json  # final-report set; evolution code must not read
+gen_batch_size: 32          # halve on OOM
+max_new_tokens: 512
+loglik_batch_size: 16
+
+# fitness cache
+cache_path: results/evomath/fitness_cache.json
+
+# logging
+wandb_project: evo-math
