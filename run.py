@@ -1,8 +1,10 @@
 from __future__ import annotations
+import os
+os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
 
 import gc
 import json
-import os
+
 import pickle
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -300,6 +302,7 @@ def search_pareto_front(
     eval_batch_size: int = 16,
     mode: str = 'prune',
     max_scale: float = 0.1,
+    max_prune: float = 0.1,
     math_task: str = 'gsm8k_cot',
     general_task: str = 'mmlu_high_school_world_history',
     math_holdout_task: str | None = None,
@@ -348,7 +351,7 @@ def search_pareto_front(
                      n=eval_samples, batch_size=eval_batch_size,
                      rotate_seed=True, seed_ref=seed_ref),
         pop_size=pop_size, n_gen=n_gen, seed=seed,
-        mode=mode, max_scale=max_scale, group_by=group_by,
+        mode=mode, max_scale=max_scale, max_prune=max_prune group_by=group_by,
         seed_ref=seed_ref, n_obj=n_obj,
     )
     if result.F is None or result.X is None:
@@ -613,6 +616,7 @@ def main():
                         'mode': args.ea_mode,
                         'max_scale': args.ea_max_scale,
                         'group_by': args.ea_group_by,
+                        'max_prune': args.ea_max_prune,
                         'fitness_version': args.ea_fitness_version,
                         'math_task': args.train_lm_eval_task or 'gsm8k_cot',
                         'general_task': getattr(args, 'ea_general_task', None),
@@ -652,6 +656,7 @@ def main():
                                 eval_batch_size=int(args.batch_size) if isinstance(args.batch_size, int) or (isinstance(args.batch_size, str) and args.batch_size.isdigit()) else 16,
                                 mode=args.ea_mode,
                                 max_scale=args.ea_max_scale,
+                                max_prune=args.ea_max_prune,
                                 math_task=args.train_lm_eval_task or 'gsm8k_cot',
                                 general_task=getattr(args, 'ea_general_task', 'mmlu_high_school_world_history'),
                                 math_holdout_task=getattr(args, 'ea_holdout_task', None),
@@ -696,6 +701,7 @@ def main():
                             math_mask, calib_mask, strengths,
                             mode=args.ea_mode,
                             max_scale=args.ea_max_scale,
+                            max_prune=args.ea_max_prune,
                         )
                         apply_mask_to_model(model, intervention_mask)
 

@@ -77,15 +77,16 @@ def build_layer_groups(
 
 
 def build_intervention_mask_per_layer(
-    math_important: dict[str, torch.Tensor],
-    calib_important: dict[str, torch.Tensor],
-    strengths: dict[str, float],
-    mode: str = 'prune',
-    max_scale: float = 0.1,
-    exclude_substring: str = 'embed',
+        math_important: dict[str, torch.Tensor],
+        calib_important: dict[str, torch.Tensor],
+        strengths: dict[str, float],
+        mode: str = 'prune',
+        max_scale: float = 0.1,
+        max_prune: float = 0.1,
+        exclude_substring: str = 'embed',
 ) -> dict[str, torch.Tensor]:
-    if mode not in {'prune', 'scale'}:
-        raise ValueError(f"mode must be 'prune' or 'scale', got {mode!r}")
+    if mode not in {'prune', 'scale', 'both'}:
+        raise ValueError(f"mode must be 'prune', 'scale', or 'both', got {mode!r}")
 
     masks: dict[str, torch.Tensor] = {}
     for name, math_mask in math_important.items():
@@ -97,10 +98,14 @@ def build_intervention_mask_per_layer(
         math_only = math_mask & (~calib_mask)
 
         strength = float(strengths.get(name, 0.0))
+
         if mode == 'prune':
             target_value = 1.0 - strength
-        else:
+        elif mode == 'scale':
             target_value = 1.0 + max_scale * strength
+        elif mode == 'both':
+            # Map strength [0, 1] to [1-max_prune, 1+max_strength]
+            target_value = (1.0 - max_prune) + strength * (max_prune + max_scale)
 
         mask = torch.ones_like(math_mask, dtype=torch.float32)
         mask[math_only] = target_value
@@ -146,10 +151,11 @@ def _build_problem_class(n_obj: int = 2):
             eval_fn: Callable[[nn.Module], tuple[float, ...]],
             mode: str = 'prune',
             max_scale: float = 0.1,
+            max_prune: float = 0.1,
             exclude_substring: str = 'embed',
         ):
-            if mode not in {'prune', 'scale'}:
-                raise ValueError(f"mode must be 'prune' or 'scale', got {mode!r}")
+            if mode not in {'prune', 'scale', 'both'}:
+                raise ValueError(f"mode must be 'prune' or 'scale' or 'both, got {mode!r}")
             super().__init__(
                 n_var=n_groups,
                 n_obj=n_obj,
@@ -165,6 +171,7 @@ def _build_problem_class(n_obj: int = 2):
             self.eval_fn = eval_fn
             self.mode = mode
             self.max_scale = max_scale
+            self.max_prune = max_prune
             self.exclude_substring = exclude_substring
             # running ideal/nadir for online normalization (higher acc = better)
             self._ideal = np.zeros(n_obj)
@@ -186,7 +193,12 @@ def _build_problem_class(n_obj: int = 2):
                     if not math_only.any():
                         continue
                     strength = strengths.get(name, 0.0)
-                    target = (1.0 - strength) if self.mode == 'prune' else (1.0 + self.max_scale * strength)
+                    if self.mode == 'prune':
+                        target = 1.0 - strength
+                    elif self.mode == 'scale':
+                        target = 1.0 + self.max_scale * strength
+                    elif self.mode == 'both':
+                        target = (1.0 - self.max_prune) + strength * (self.max_prune + self.max_scale)
                     params[name][math_only] = params[name][math_only] * target
             try:
                 raw = self.eval_fn(self.model)
@@ -308,6 +320,7 @@ def run_ea_search(
     n_gen: int = 30,
     mode: str = 'prune',
     max_scale: float = 0.1,
+    max_prune: float = 0.1,
     exclude_substring: str = 'embed',
     seed: int = 42,
     verbose: bool = True,
@@ -340,6 +353,7 @@ def run_ea_search(
         eval_fn=eval_fn,
         mode=mode,
         max_scale=max_scale,
+        max_prune=max_prune,
         exclude_substring=exclude_substring,
     )
 
