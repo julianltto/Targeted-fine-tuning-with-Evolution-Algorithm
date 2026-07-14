@@ -20,8 +20,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
-import torch  # noqa: E402
-
 from evomath import load_config  # noqa: E402
 from evomath.common.seeding import seed_everything  # noqa: E402
 from evomath.harness import data as hdata  # noqa: E402
@@ -99,14 +97,23 @@ def main():
     cache = FitnessCache(cfg["cache_path"])
     idx_hash = file_hash(cfg["eval_indices"])
     ind = hmodel.random_lora_individual(model, sigma=args.lora_sigma, generator=gen)
-    key = individual_key(ind.named_tensors(), "loglik", idx_hash)
-    handles = hmodel.patch_lora(model, ind)
-    try:
-        cache.put(key, fitness_loglik(model, tok, docs, batch_size=cfg["loglik_batch_size"]))
-    finally:
-        hmodel.unpatch_lora(handles)
+
+    def cached_loglik_lora():
+        key = individual_key(ind.named_tensors(), "loglik", idx_hash)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        handles = hmodel.patch_lora(model, ind)
+        try:
+            score = fitness_loglik(model, tok, docs, batch_size=cfg["loglik_batch_size"])
+        finally:
+            hmodel.unpatch_lora(handles)
+        cache.put(key, score)
+        return score
+
+    cached_loglik_lora()
     t1 = time.time()
-    hit = cache.get(individual_key(ind.named_tensors(), "loglik", idx_hash))
+    hit = cached_loglik_lora()
     cache_seconds = time.time() - t1
     cache_ok = hit is not None and cache_seconds < 1.0
     print(f"[m0] cache second lookup: {cache_seconds*1000:.0f} ms -> {'PASS' if cache_ok else 'FAIL'}")
