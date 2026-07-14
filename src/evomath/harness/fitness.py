@@ -38,6 +38,19 @@ def fitness_acc(model, tokenizer, docs: list[dict],
     return acc
 
 
+def _gather_token_loglik(logits: torch.Tensor, targets: torch.Tensor,
+                         seq_chunk: int = 128) -> torch.Tensor:
+    """Per-token loglik of `targets` under `logits` (already shifted), fp32
+    log-softmax computed in sequence chunks — never materializes the full-vocab
+    fp32 tensor (which is ~8GB for bs16 x 1k tokens x 128k vocab)."""
+    parts = []
+    for s in range(0, logits.shape[1], seq_chunk):
+        lp = torch.log_softmax(logits[:, s:s + seq_chunk].float(), dim=-1)
+        parts.append(lp.gather(-1, targets[:, s:s + seq_chunk].unsqueeze(-1)).squeeze(-1))
+        del lp
+    return torch.cat(parts, dim=1)
+
+
 @torch.no_grad()
 def fitness_loglik(model, tokenizer, docs: list[dict], batch_size: int = 16) -> float:
     """Mean over questions of (mean per-token loglik of the gold solution)."""
@@ -50,10 +63,8 @@ def fitness_loglik(model, tokenizer, docs: list[dict], batch_size: int = 16) -> 
         enc = tokenizer(fulls, return_tensors="pt", padding=True).to(model.device)
         prompt_lens = [len(tokenizer(p)["input_ids"]) for p in prompts]
 
-        logits = model(**enc).logits.float()
-        logprobs = torch.log_softmax(logits[:, :-1], dim=-1)
-        targets = enc["input_ids"][:, 1:]
-        token_ll = logprobs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        logits = model(**enc).logits
+        token_ll = _gather_token_loglik(logits[:, :-1], enc["input_ids"][:, 1:])
 
         attn = enc["attention_mask"][:, 1:]
         for i, plen in enumerate(prompt_lens):
