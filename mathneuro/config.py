@@ -34,6 +34,9 @@ class MathNeuroConfig:
     ea_eval_samples: int = 30
     ea_fitness_version: str = 'gsm8k_cot_flex_v2'
     ea_general_task: str = 'mmlu_high_school_world_history'
+    ea_holdout_task: str | None = None
+    ea_n_obj: int = 2
+    ea_group_by: str = 'none'       # 'none' | 'proj_type' | 'block'
 
     batch_size: int | str = 1
 
@@ -42,6 +45,11 @@ class MathNeuroConfig:
             raise ValueError(
                 "`calibration_datasets` and `calibration_dataset_names` must have the same length "
                 f"(got {len(self.calibration_datasets)} and {len(self.calibration_dataset_names)})."
+            )
+        if self.ea_group_by not in {'none', 'proj_type', 'block'}:
+            raise ValueError(
+                "`ea_group_by` must be one of 'none', 'proj_type', 'block' "
+                f"(got {self.ea_group_by!r})."
             )
 
     def replace(self, **overrides: Any) -> "MathNeuroConfig":

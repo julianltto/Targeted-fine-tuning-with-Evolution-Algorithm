@@ -10,6 +10,7 @@ from mathneuro.core import (
 )
 from mathneuro.ea_search import (
     list_prunable_layer_names,
+    build_layer_groups,
     build_intervention_mask_per_layer,
     build_prune_mask_per_layer,
     backup_weights,
@@ -33,6 +34,7 @@ __all__ = [
     "build_prune_mask",
     "apply_mask_to_model",
     "list_prunable_layer_names",
+    "build_layer_groups",
     "build_intervention_mask_per_layer",
     "build_prune_mask_per_layer",
     "backup_weights",
